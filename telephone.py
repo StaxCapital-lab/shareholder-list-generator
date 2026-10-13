@@ -1,43 +1,13 @@
-"""
-Telephone Number Finder
-=========================
-What this program does:
-1. Receives the path to an Excel file (command-line argument) - the same file
-   that app3.py creates.
-2. Opens gulesider.no via Selenium and, for each shareholder on the
-   "Private 2024" and "Selskap 2024" sheets, looks up a phone number using
-   name + zip code.
-3. Writes the found numbers into the "TELEPHONE" column and saves the file
-   with a " (T)" suffix.
-
-telephone2.py version notes:
-- MAIN BUG FIX: removed the cv2, numpy, PIL.Image, BytesIO imports - they
-  were never used anywhere in the code, and the opencv-python (cv2) library
-  simply wasn't installed, which made the script crash right at startup
-  with ModuleNotFoundError.
-- Added headless mode (needed to run on a server, where there is no display).
-- Added column checks ("SHAREHOLDER", "ZIP CODE / CITY", "TELEPHONE")
-  before processing, so the script doesn't crash with a KeyError if a
-  column is missing.
-- driver.quit() now always runs (even if something fails) - previously
-  Chrome could stay open/hang in memory after an error.
-- Renaming the final file no longer crashes if a file with the " (T)"
-  suffix already exists.
-- Code split into sections with comments.
-- FIX: force stdout/stderr to UTF-8 so the script doesn't crash on Windows
-  terminals using a legacy codepage (e.g. cp1251) when printing emoji
-  characters like the ones used in the log messages below.
-"""
-
 # ============================================================
-# 0. FORCE UTF-8 OUTPUT (fixes UnicodeEncodeError on Windows)
+# FORCE UTF-8 OUTPUT (fixes UnicodeEncodeError when this script is
+# launched via subprocess, e.g. from app3.py/app5.py). When output is
+# piped/captured instead of going to a real console, Python falls back to
+# the system codepage (e.g. cp1251 on Windows), which can't encode the
+# emoji used in the print() messages below. Must run before any print().
 # ============================================================
 import sys
 import io
 
-# On Windows, the default console codepage (e.g. cp1251) often can't encode
-# emoji characters. Reconfigure stdout/stderr to UTF-8 so print() never
-# crashes on these log messages, regardless of the terminal's codepage.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -45,472 +15,668 @@ else:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-
-# ============================================================
-# 1. IMPORTS
-# ============================================================
 import time
-import re
-import os
-import random
-
 import pandas as pd
-from openpyxl import load_workbook
-
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+import re
+from openpyxl import load_workbook
+import sys
+import os
+import random
+import logging
+import platform
+import atexit
 
-# Note: cv2 (opencv-python), numpy and PIL.Image were in the original file
-# but never used anywhere - they were removed so the script doesn't require
-# extra dependencies that aren't even in requirements.
-
-
-# ============================================================
-# 2. READ COMMAND-LINE ARGUMENTS
-# ============================================================
+# Get the file path from the command-line argument
 if len(sys.argv) < 2:
-    print("❌ Error: No file path provided!")
+    print("Error: No file path provided!")
+    print("Usage: python3 telephone_1881_batch_updated.py <excel_file_path>")
     sys.exit(1)
 
-file_path = sys.argv[1]  # Excel file path received from app3.py
-sheets = ["Private 2024", "Selskap 2024"]  # sheets that need to be processed
+file_path = sys.argv[1]  # dynamically gets the correct file path from app.py
+sheets = ["Private 2024", "Selskap 2024"]  # Sheets to process
+# NOTE: "Selskap 2024" (companies) added back for feature parity with the
+# gulesider.no version. If you only ever need phone numbers for private
+# shareholders, just remove "Selskap 2024" from this list again.
 
-print(f"ℹ️ Received file path: {file_path}")
-print(f"ℹ️ File exists: {os.path.exists(file_path)}")
+# Setup logging for debugging. The log file is written next to the input
+# Excel file (inside this run's own session folder) instead of a single
+# shared "telephone_debug.log" in the program folder - otherwise several
+# people running this on the server at the same time would overwrite each
+# other's logs.
+log_path = os.path.join(os.path.dirname(file_path) or '.', 'telephone_debug.log')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_path),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Debug: Print file path and check if file exists
+print(f"Received file path: {file_path}")
+print(f"File exists: {os.path.exists(file_path)}")
 if os.path.exists(file_path):
-    print(f"ℹ️ File size: {os.path.getsize(file_path)} bytes")
+    print(f"File size: {os.path.getsize(file_path)} bytes")
+    print(f"File extension: {os.path.splitext(file_path)[1]}")
 else:
-    print("❌ ERROR: File does not exist!")
+    print("ERROR: File does not exist!")
     sys.exit(1)
 
-
 # ============================================================
-# 3. CHROME SETUP
+# VIRTUAL DISPLAY (Xvfb) FOR SERVER DEPLOYMENT
 # ============================================================
-def build_chrome_driver(headless=True):
-    """
-    Creates a Chrome WebDriver configured to block ads and run reliably on
-    a server (headless).
+# This script never uses Chrome's --headless flag, because headless Chrome
+# is much more likely to get flagged as a bot by sites like this one. On a
+# server (no physical screen), we instead start a virtual display (Xvfb)
+# and run Chrome normally against it - Chrome behaves exactly like a
+# regular visible browser, it just isn't shown on a real monitor.
+# Requires on the server: `sudo apt install xvfb` and
+# `pip install pyvirtualdisplay`. Locally on Windows this block is skipped
+# entirely, so a real Chrome window still opens, same as before.
+virtual_display = None
+used_headless_fallback = False
 
-    headless=True is required on a server (no graphical display there).
-    It's also recommended to test locally with headless=True, so behavior
-    matches what happens on the server.
-    """
-    options = Options()
+if platform.system() == "Linux":
+    try:
+        from pyvirtualdisplay import Display
+        virtual_display = Display(visible=False, size=(1920, 1080))
+        virtual_display.start()
+        atexit.register(virtual_display.stop)
+        print("🖥️ Virtual display (Xvfb) started for server environment")
+    except Exception as e:
+        print(f"⚠️ Could not start virtual display ({e}) - falling back to --headless=new")
+        used_headless_fallback = True
 
-    if headless:
-        options.add_argument("--headless=new")
+# Initialize WebDriver with enhanced options
+options = webdriver.ChromeOptions()
 
-    # Ad blocking / stability
-    options.add_argument("--disable-extensions-except")
-    options.add_argument("--disable-plugins-discovery")
-    options.add_argument("--disable-web-security")
-    options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--disable-ipc-flooding-protection")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
+# Enhanced options for better stability and stealth
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+options.add_argument("--disable-gpu")
+options.add_argument("--disable-blink-features=AutomationControlled")
+options.add_argument("--disable-extensions")
+options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+options.add_experimental_option('useAutomationExtension', False)
 
-    options.add_experimental_option("prefs", {
-        "profile.default_content_setting_values": {
-            "notifications": 2,   # block notifications
-            "popups": 2,          # block popups
-            "media_stream": 2,    # block camera/microphone access
-            "plugins": 2,
-            "images": 1,          # images are needed for the site to work properly
-            "javascript": 1,
-        },
-        "profile.managed_default_content_settings": {"images": 1}
-    })
+if used_headless_fallback:
+    options.add_argument("--headless=new")
 
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+# User agent to appear more like a regular browser
+user_agents = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+]
+selected_user_agent = random.choice(user_agents)
+options.add_argument(f"--user-agent={selected_user_agent}")
+
+driver = None
+
+
+def _cleanup():
+    """Makes sure Chrome (and the virtual display, if used) never stay
+    hanging in memory, however the script exits - runs automatically at
+    program exit, including on crashes and sys.exit()."""
+    try:
+        if driver is not None:
+            driver.quit()
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup)
+
+try:
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()), options=options
     )
 
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=options)
+    # Hide webdriver property
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
+    print("🔧 Chrome driver setup completed")
+except Exception as e:
+    print(f"❌ Failed to start Chrome driver: {e}")
+    sys.exit(1)
 
-driver = build_chrome_driver(headless=True)
-print("✅ ChromeDriver started successfully")
-
-
-# ============================================================
-# 4. FUNCTIONS FOR HANDLING ADS / MODAL WINDOWS
-# ============================================================
-def detect_and_close_ad(driver):
-    """Tries to find and close ads/popups using several strategies."""
-    print(f"ℹ️ Searching for ads at {time.strftime('%H:%M:%S', time.localtime())}")
-
-    google_ad_selectors = [
-        "iframe[src*='googleads']",
-        "iframe[src*='googlesyndication']",
-        "iframe[src*='doubleclick']",
-        "div[id*='google_ads']",
-        "div[class*='google-ad']",
-        "div[data-google-av-cxn]",
-        "div[data-google-av-cid]",
-        "div[style*='position: fixed'][style*='z-index']",
-        "div[style*='position: absolute'][style*='z-index']",
-        "[style*='z-index: 9999']",
-        "[style*='z-index: 999999']",
-        ".modal-overlay",
-        ".modal-backdrop",
-        ".ad-overlay"
-    ]
-
-    close_button_selectors = [
-        "button[aria-label*='close' i]",
-        "button[aria-label*='lukk' i]",  # "close" in Norwegian
-        "button[title*='close' i]",
-        "button[title*='lukk' i]",
-        "button.close",
-        "button[class*='close']",
-        "span.close",
-        "div.close",
-        "[data-dismiss]",
-        "[data-close]",
-        ".ad-close",
-        ".close-btn",
-        ".close-button"
-    ]
-
-    try:
-        time.sleep(2)  # give ads time to load
-
-        # Strategy 1: hide/remove ad blocks
-        for selector in google_ad_selectors:
-            try:
-                ad_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for ad_element in ad_elements:
-                    try:
-                        driver.execute_script("arguments[0].style.display = 'none';", ad_element)
-                    except Exception:
-                        pass
-                    if ad_element.tag_name == 'iframe':
-                        try:
-                            driver.execute_script("arguments[0].remove();", ad_element)
-                        except Exception:
-                            pass
-            except Exception:
-                continue
-
-        # Strategy 2: click the close button, if found
-        for selector in close_button_selectors:
-            try:
-                close_buttons = driver.find_elements(By.CSS_SELECTOR, selector)
-                for button in close_buttons:
-                    try:
-                        if button.is_displayed() and button.is_enabled():
-                            driver.execute_script("arguments[0].click();", button)
-                            time.sleep(1)
-                            return True
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-
-        # Strategy 3: find close button via XPath by text
-        xpath_selectors = [
-            "//button[contains(text(), '×')]",
-            "//button[contains(text(), '✕')]",
-            "//span[contains(text(), '×')]",
-            "//div[contains(text(), '×')]",
-            "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'close')]",
-            "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'lukk')]",
-            "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'skip')]",
-            "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'hopp over')]"
-        ]
-        for xpath in xpath_selectors:
-            try:
-                close_buttons = driver.find_elements(By.XPATH, xpath)
-                for button in close_buttons:
-                    try:
-                        if button.is_displayed() and button.is_enabled():
-                            driver.execute_script("arguments[0].click();", button)
-                            time.sleep(1)
-                            return True
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-
-        # Strategy 4: Escape key
-        try:
-            driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
-            time.sleep(1)
-        except Exception as e:
-            print(f"ℹ️ Could not press Escape: {e}")
-
-        # Strategy 5: click in "safe" screen areas to close the overlay
-        safe_click_areas = [(10, 10), (10, 100), (100, 10), (50, 50)]
-        for x, y in safe_click_areas:
-            try:
-                action = ActionChains(driver)
-                action.move_by_offset(x, y).click().perform()
-                time.sleep(0.5)
-                action.move_by_offset(-x, -y).perform()
-            except Exception as e:
-                print(f"ℹ️ Could not click at ({x}, {y}): {e}")
-                continue
-
-        print("ℹ️ Ad-closing attempts finished")
-        return False
-
-    except Exception as e:
-        print(f"⚠️ Error in detect_and_close_ad: {e}")
-        return False
-
-
-def check_for_blocking_elements(driver):
-    """Checks whether the page has large elements that might be blocking content (ads/modals)."""
-    blocking_selectors = [
-        "[style*='z-index: 9999']",
-        "[style*='z-index: 999999']",
-        "iframe[src*='google']",
-        ".modal-overlay",
-        ".modal-backdrop",
-        "div[style*='position: fixed']",
-        "div[style*='position: absolute'][style*='top: 0'][style*='left: 0']"
-    ]
-    for selector in blocking_selectors:
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-            for element in elements:
-                if element.is_displayed():
-                    size = element.size
-                    if size['height'] > 200 and size['width'] > 200:
-                        print(f"⚠️ Found a potentially blocking element: {selector}")
-                        return True
-        except Exception:
-            continue
-    return False
-
-
-# ============================================================
-# 5. INITIAL SITE LOAD
-# ============================================================
-driver.get("https://www.gulesider.no/")
+# Navigate to 1881.no
+print("\n🌐 ACCESSING 1881.NO...")
+print("="*60)
 
 try:
-    WebDriverWait(driver, 10).until(
-        EC.visibility_of_element_located((By.CSS_SELECTOR, "button.css-1b11xpz"))
-    )
-    button = driver.find_element(By.CSS_SELECTOR, "button.css-1b11xpz")
-    driver.execute_script("arguments[0].click();", button)
-    print("✅ Button clicked (e.g. cookie consent)")
-    time.sleep(2)
+    driver.get("https://www.1881.no/")
+    print("✅ Page request sent to 1881.no")
+    time.sleep(random.uniform(3, 6))
 except Exception as e:
-    print(f"ℹ️ Button not found or could not be clicked (it may not have appeared): {e}")
-
-try:
-    detect_and_close_ad(driver)
-except Exception as e:
-    print(f"⚠️ Initial ad handling failed: {e}")
-
-
-# ============================================================
-# 6. LOOK UP THE PHONE NUMBER FOR ONE SHAREHOLDER
-# ============================================================
-def get_phone_number(name, zip_code):
-    """Searches gulesider.no for a phone number by name + zip code. Returns "" if not found."""
-    try:
-        if check_for_blocking_elements(driver):
-            print("⚠️ Blocking elements found, closing ads...")
-            detect_and_close_ad(driver)
-            time.sleep(1)
-
-        search_bar = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.ID, "searchbox-input-app-input"))
-        )
-        search_bar.clear()
-        search_bar.send_keys(f"{name} {zip_code}")
-        search_bar.send_keys(Keys.RETURN)
-        time.sleep(2)
-
-        if check_for_blocking_elements(driver):
-            print("⚠️ Blocking elements found after search, closing ads...")
-            detect_and_close_ad(driver)
-            time.sleep(1)
-
-        phone_elements = None
-        max_attempts = 3
-
-        for attempt in range(max_attempts):
-            try:
-                phone_elements = WebDriverWait(driver, 4).until(
-                    EC.presence_of_all_elements_located((By.CLASS_NAME, "text-nowrap"))
-                )
-                if phone_elements:
-                    break
-            except TimeoutException:
-                if attempt < max_attempts - 1:
-                    print(f"ℹ️ Attempt {attempt + 1} failed, checking for ads...")
-                    if check_for_blocking_elements(driver):
-                        detect_and_close_ad(driver)
-                        time.sleep(1)
-                    continue
-                else:
-                    return "-"
-
-        if not phone_elements:
-            return "-"
-
-        phone_number = phone_elements[0].text.strip()
-
-        # If the number is truncated behind a "Vis" (show) link - open the full card
-        if "Vis" in phone_number:
-            try:
-                vis_button = WebDriverWait(driver, 4).until(
-                    EC.element_to_be_clickable((By.CLASS_NAME, "text-nowrap"))
-                )
-                vis_button.click()
-                time.sleep(2)
-
-                if check_for_blocking_elements(driver):
-                    print("⚠️ Blocking elements found on the details page, closing ads...")
-                    detect_and_close_ad(driver)
-                    time.sleep(1)
-
-                full_phone_element = WebDriverWait(driver, 4).until(
-                    EC.presence_of_element_located((By.XPATH, "//p[contains(@class, 'text-2xl')]"))
-                )
-                phone_number = full_phone_element.text.strip()
-
-            except TimeoutException:
-                return "Error retrieving full number"
-
-        if re.search(r"Endre bedriftsinformasjon", phone_number):
-            return ""
-
-        return phone_number
-
-    except Exception as e:
-        print(f"⚠️ Error in get_phone_number for '{name}': {e}")
-        try:
-            detect_and_close_ad(driver)
-        except Exception:
-            pass
-        return ""
-
-
-# ============================================================
-# 7. LOAD THE EXCEL FILE
-# ============================================================
-try:
-    print(f"ℹ️ Loading file: {file_path}")
-    wb = load_workbook(file_path)
-    print(f"✅ File loaded. Sheets: {wb.sheetnames}")
-except Exception as e:
-    print(f"❌ Could not load the Excel file: {e}")
+    print(f"❌ Error accessing 1881.no: {e}")
     driver.quit()
     sys.exit(1)
 
+def handle_consent_popup():
+    """Handle the consent popup that appears on 1881.no"""
+    print("\n🔍 HANDLING CONSENT POPUP...")
+    print("="*50)
+    
+    try:
+        time.sleep(3)
+        
+        # Check if consent popup is present
+        page_source = driver.page_source.lower()
+        if "give us your consent" in page_source:
+            print("🔍 Consent popup detected, attempting to close...")
+            
+            # Try to find and click the "Agree and close" button
+            button_selectors = [
+                "button[class*='agree']",
+                "button:contains('Agree and close')",
+                ".consent-button",
+                "[data-consent='accept']",
+            ]
+            
+            for selector in button_selectors:
+                try:
+                    button = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                    driver.execute_script("arguments[0].click();", button)
+                    print("✅ Consent popup closed successfully!")
+                    time.sleep(2)
+                    return True
+                except:
+                    continue
+            
+            print("⚠️ Could not automatically close consent popup")
+            return False
+        else:
+            print("✅ No consent popup detected")
+            return True
+            
+    except Exception as e:
+        print(f"❌ Error handling consent popup: {e}")
+        return False
 
-# ============================================================
-# 8. PROCESS SHEETS: LOOK UP AND WRITE PHONE NUMBERS
-# ============================================================
+def verify_person_match(page_name, search_name, zip_code):
+    """Verify if the person on the page matches the search criteria"""
+    try:
+        # Normalize names for comparison
+        page_name_normalized = page_name.lower().strip()
+        search_name_normalized = search_name.lower().strip()
+
+        # Check if names match (allow for slight variations)
+        name_match = (search_name_normalized in page_name_normalized or
+                     page_name_normalized in search_name_normalized or
+                     search_name_normalized.split()[0] in page_name_normalized)
+
+        if not name_match:
+            print(f"⚠️ Name mismatch: expected '{search_name}', found '{page_name}'")
+            return False
+
+        print(f"✅ Name match confirmed: '{page_name}'")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Could not verify person match: {e}")
+        return True  # Continue anyway if verification fails
+
+def extract_postal_code_from_address(address_text):
+    """Extract postal code from address text"""
+    try:
+        # Look for 4-digit postal code pattern
+        postcode_match = re.search(r'(\d{4})', address_text)
+        if postcode_match:
+            return postcode_match.group(1)
+    except:
+        pass
+    return None
+
+def get_all_postal_codes_on_page():
+    """Get all postal codes visible on the current page"""
+    try:
+        page_text = driver.page_source
+        # Find all 4-digit postal codes on the page
+        postal_codes = re.findall(r'\b(\d{4})\b', page_text)
+        return list(set(postal_codes))  # Return unique postal codes
+    except:
+        pass
+    return []
+
+def verify_phone_postal_code_match(phone_element, expected_zip_code):
+    """
+    Verify if the phone number's address matches the expected postal code.
+    This helps identify when a person has multiple addresses.
+
+    Strategy: Check if the expected postal code is visible on the page
+    and appears near the phone number in the page structure.
+    """
+    try:
+        # Get all postal codes on the page
+        page_postal_codes = get_all_postal_codes_on_page()
+
+        # If the expected postal code is not on the page at all, it's a mismatch
+        if expected_zip_code not in page_postal_codes:
+            print(f"📍 Expected postal code {expected_zip_code} NOT found on page")
+            print(f"   Available postal codes: {page_postal_codes}")
+            return False
+
+        # If the expected postal code is on the page, it's likely a match
+        # (since we already verified the person name matches)
+        print(f"📍 Expected postal code {expected_zip_code} found on page")
+        print(f"   Available postal codes: {page_postal_codes}")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Error verifying postal code: {e}")
+        pass
+
+    return None  # Could not determine
+
+def clean_phone_number(phone_number):
+    """Clean and format Norwegian phone number"""
+    if not phone_number:
+        return phone_number
+    
+    # Remove all non-digit characters except +
+    cleaned = re.sub(r'[^\d\+]', '', phone_number)
+    
+    # Remove Norwegian country codes
+    if cleaned.startswith('0047'):
+        cleaned = cleaned[4:]  # Remove 0047
+    elif cleaned.startswith('+47'):
+        cleaned = cleaned[3:]  # Remove +47
+    elif cleaned.startswith('47') and len(cleaned) == 10:
+        cleaned = cleaned[2:]  # Remove 47 if it's a 10-digit number starting with 47
+    
+    # Ensure it's 8 digits (standard Norwegian mobile/landline)
+    if len(cleaned) == 8 and cleaned.isdigit():
+        # Format as XX XX XX XX
+        return f"{cleaned[:2]} {cleaned[2:4]} {cleaned[4:6]} {cleaned[6:8]}"
+    
+    # If not standard 8 digits, return as-is but cleaned
+    return cleaned
+
+def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
+    """Extract phone number using the improved method with retry logic"""
+    try:
+        print(f"🔍 Searching for: {name} in postal code {zip_code}")
+
+        # Find search input
+        search_input = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search']"))
+        )
+
+        # Clear and enter search term (include postal code in search)
+        search_term = f"{name} {zip_code}"
+        search_input.clear()
+        search_input.send_keys(search_term)
+
+        # Submit search
+        search_input.submit()
+
+        # Wait for search results to load
+        time.sleep(3)
+
+        current_url = driver.current_url
+        print(f"📍 Current URL: {current_url}")
+
+        # Check if we're on a search results page (not a person detail page yet)
+        if "/person/" not in current_url:
+            print("📋 On search results page, attempting to click first result...")
+
+            # Try to find and click the first search result
+            try:
+                # Wait for search results to appear with multiple selector options
+                result_selectors = [
+                    "a[href*='/person/']",
+                    ".search-result a",
+                    ".result-item a",
+                    "div[class*='result'] a"
+                ]
+
+                first_result = None
+                for selector in result_selectors:
+                    try:
+                        WebDriverWait(driver, 5).until(
+                            EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
+                        )
+                        first_result = driver.find_element(By.CSS_SELECTOR, selector)
+                        print(f"✅ Found result with selector: {selector}")
+                        break
+                    except:
+                        continue
+
+                if not first_result:
+                    print("❌ Could not find any search results")
+                    return "-"
+
+                print(f"🔗 Found first result link: {first_result.get_attribute('href')}")
+
+                # Click the first result
+                driver.execute_script("arguments[0].click();", first_result)
+
+                # Wait for person detail page to load
+                time.sleep(3)
+
+                # Verify we're now on a person page
+                current_url = driver.current_url
+                print(f"📍 After click - Current URL: {current_url}")
+
+                if "/person/" not in current_url:
+                    print("❌ Failed to navigate to person detail page after clicking")
+                    return "-"
+
+            except Exception as e:
+                print(f"❌ Error clicking first result: {e}")
+                return "-"
+
+        # Now we should be on a person detail page
+        if "/person/" in current_url:
+            print("✅ Successfully navigated to person detail page!")
+            
+            # Verify this is the correct person by checking the name
+            try:
+                name_element = driver.find_element(By.CSS_SELECTOR, ".details-name, h1")
+                page_name = name_element.text.strip()
+                print(f"👤 Found person: {page_name}")
+
+                # Verify the person matches our search criteria
+                if not verify_person_match(page_name, name, zip_code):
+                    print(f"❌ Person verification failed")
+                    return "-"
+            except:
+                print("⚠️ Could not verify person name")
+            
+            # Look for postal code in the address
+            try:
+                address_elements = driver.find_elements(By.CSS_SELECTOR, ".listing-address, .address, .location")
+                address_found = False
+                found_postal_codes = []
+
+                for addr_elem in address_elements:
+                    address_text = addr_elem.text
+                    print(f"📍 Found address: {address_text}")
+
+                    # Extract postal code from address
+                    extracted_zip = extract_postal_code_from_address(address_text)
+                    if extracted_zip:
+                        found_postal_codes.append(extracted_zip)
+                        print(f"   Extracted postal code: {extracted_zip}")
+
+                    # Check if postal code is in the address
+                    if zip_code in address_text:
+                        print(f"✅ Postal code {zip_code} confirmed in address!")
+                        address_found = True
+                        break
+
+                if not address_found:
+                    # Check page source for postal code
+                    if zip_code in driver.page_source:
+                        print(f"✅ Postal code {zip_code} found in page source!")
+                        address_found = True
+
+                if not address_found:
+                    print(f"⚠️ Could not confirm postal code {zip_code}")
+                    print(f"   Found postal codes on page: {found_postal_codes}")
+                    return "-"
+            except:
+                print("⚠️ Could not check address")
+            
+            # Now extract phone number
+            print("📞 Looking for phone number...")
+
+            # Get all postal codes on the page first
+            page_postal_codes = get_all_postal_codes_on_page()
+            print(f"📍 Postal codes found on page: {page_postal_codes}")
+
+            # Strategy 1: Look for phone links
+            try:
+                phone_links = driver.find_elements(By.CSS_SELECTOR, "a[href^='tel:']")
+                print(f"📞 Found {len(phone_links)} phone link(s)")
+
+                for i, link in enumerate(phone_links):
+                    phone_href = link.get_attribute('href')
+                    phone_number = phone_href.replace('tel:', '').strip()
+                    if phone_number:
+                        cleaned_phone = clean_phone_number(phone_number)
+                        print(f"📞 Phone link {i+1}: {cleaned_phone}")
+
+                        # Verify postal code match if we have a zip code to verify
+                        if zip_code:
+                            # Check if the expected postal code is on the page
+                            if zip_code not in page_postal_codes:
+                                print(f"⚠️ Skipping phone {cleaned_phone} - postal code {zip_code} not found on page")
+                                continue
+                            else:
+                                print(f"✅ Postal code {zip_code} confirmed on page")
+
+                        print(f"✅ Returning phone number: {cleaned_phone}")
+                        return cleaned_phone
+            except Exception as e:
+                print(f"⚠️ Error processing phone links: {e}")
+            
+            # Strategy 2: Look for phone in specific elements
+            phone_selectors = [
+                ".button-call__number",
+                ".contact-featured__call",
+                ".phone",
+                ".telephone",
+                ".tlf",
+                ".mobil",
+                ".contact-phone"
+            ]
+
+            for selector in phone_selectors:
+                try:
+                    phone_elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    print(f"📞 Found {len(phone_elements)} element(s) with selector '{selector}'")
+
+                    for i, elem in enumerate(phone_elements):
+                        phone_text = elem.text.strip()
+                        if phone_text and re.search(r'\d', phone_text):
+                            # Clean up phone number
+                            phone_clean = re.sub(r'[^\d\+\s]', '', phone_text)
+                            if len(phone_clean.replace(' ', '')) >= 8:  # Norwegian phone numbers are 8 digits
+                                cleaned_phone = clean_phone_number(phone_clean)
+                                print(f"📞 Phone element {i+1}: {cleaned_phone}")
+
+                                # Verify postal code match if we have a zip code to verify
+                                if zip_code:
+                                    # Check if the expected postal code is on the page
+                                    if zip_code not in page_postal_codes:
+                                        print(f"⚠️ Skipping phone {cleaned_phone} - postal code {zip_code} not found on page")
+                                        continue
+                                    else:
+                                        print(f"✅ Postal code {zip_code} confirmed on page")
+
+                                print(f"✅ Returning phone number: {cleaned_phone}")
+                                return cleaned_phone
+                except Exception as e:
+                    print(f"⚠️ Error with selector '{selector}': {e}")
+                    continue
+            
+            # Strategy 3: Look for phone in page text using regex
+            page_text = driver.page_source
+            
+            # Norwegian phone number patterns
+            phone_patterns = [
+                r'(\+47\s?)?(\d{2}\s?\d{2}\s?\d{2}\s?\d{2})',  # +47 XX XX XX XX or XX XX XX XX
+                r'(\+47\s?)?\d{8}',  # +47XXXXXXXX or XXXXXXXX
+                r'tel:(\+47)?(\d{8})',  # tel: links
+            ]
+            
+            for pattern in phone_patterns:
+                matches = re.findall(pattern, page_text)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        phone_number = ''.join(match)
+                    else:
+                        phone_number = match
+                    
+                    # Clean and validate
+                    phone_clean = re.sub(r'[^\d\+]', '', phone_number)
+                    if len(phone_clean) >= 8:
+                        cleaned_phone = clean_phone_number(phone_clean)
+                        print(f"📞 Found phone number with regex: {cleaned_phone}")
+                        return cleaned_phone
+            
+            print("❌ No phone number found on person page")
+            return "-"
+            
+        else:
+            print("❌ Did not reach person detail page")
+            print("📋 Current page might be search results or error page")
+
+            # Retry with just the name (without postal code)
+            if retry_count < max_retries:
+                print(f"🔄 Retrying with just name (attempt {retry_count + 1}/{max_retries})...")
+                time.sleep(2)
+                return get_phone_number(name, "", retry_count + 1, max_retries)
+
+            return "-"
+
+    except Exception as e:
+        print(f"❌ Error during phone extraction: {e}")
+
+        # Retry on error
+        if retry_count < max_retries:
+            print(f"🔄 Retrying after error (attempt {retry_count + 1}/{max_retries})...")
+            time.sleep(3)
+            return get_phone_number(name, zip_code, retry_count + 1, max_retries)
+
+        return "-"
+
+# Handle consent popup
+consent_handled = handle_consent_popup()
+
+if not consent_handled:
+    print("⚠️ Consent popup handling failed, but continuing...")
+
+print("✅ Successfully loaded 1881.no and ready to extract phone numbers")
+
+# Load existing workbook
 try:
-    for sheet_name in sheets:
-        if sheet_name not in wb.sheetnames:
-            print(f"⚠️ Sheet '{sheet_name}' not found in the file, skipping")
-            continue
+    print(f"\n📊 Loading workbook: {file_path}")
+    wb = load_workbook(file_path)
+    print("✅ Workbook loaded successfully")
+    print(f"📋 Available sheets: {wb.sheetnames}")
+except Exception as e:
+    print(f"❌ ERROR: Failed to load workbook: {e}")
+    driver.quit()
+    sys.exit(1)
 
-        print(f"ℹ️ Processing sheet: {sheet_name}")
+# Process each sheet separately
+for sheet_name in sheets:
+    if sheet_name not in wb.sheetnames:
+        print(f"⚠️ Sheet '{sheet_name}' not found in workbook, skipping...")
+        continue
+        
+    print(f"\n📊 Processing sheet: {sheet_name}")
+    print("="*50)
+
+    try:
+        # Load data from the current sheet
         df = pd.read_excel(file_path, sheet_name=sheet_name)
-
-        # Check that the required columns exist, to avoid a KeyError
-        required_columns = ["SHAREHOLDER", "ZIP CODE / CITY"]
-        missing = [c for c in required_columns if c not in df.columns]
-        if missing:
-            print(f"⚠️ Sheet '{sheet_name}' is missing columns {missing} - skipping sheet")
+        print(f"📋 Found {len(df)} rows in sheet '{sheet_name}'")
+        
+        # Check if required columns exist
+        if "SHAREHOLDER" not in df.columns or "ZIP CODE / CITY" not in df.columns:
+            print(f"⚠️ Required columns not found in sheet '{sheet_name}', skipping...")
             continue
-
+        
+        # Add TELEPHONE column if it doesn't exist
         if "TELEPHONE" not in df.columns:
-            print(f"⚠️ Sheet '{sheet_name}' has no 'TELEPHONE' column - adding it")
-            ws_check = wb[sheet_name]
-            new_col_idx = ws_check.max_column + 1
-            ws_check.cell(row=1, column=new_col_idx, value="TELEPHONE")
             df["TELEPHONE"] = ""
+            print("📋 Added TELEPHONE column")
 
+        # List to store phone numbers
         phone_numbers = []
 
+        # Iterate through dataframe and fetch phone numbers
         for index, row in df.iterrows():
-            # Guard against empty/NaN name or zip code values, so the search doesn't break
-            name = "" if pd.isna(row["SHAREHOLDER"]) else str(row["SHAREHOLDER"]).strip()
-            postcode = "" if pd.isna(row["ZIP CODE / CITY"]) else str(row["ZIP CODE / CITY"])[:4]
+            name = str(row["SHAREHOLDER"]).strip()
 
-            if not name:
-                print(f"ℹ️ Row {index + 1}: empty name, skipping")
-                phone_numbers.append("")
+            # Extract postal code properly from "ZIP CODE / CITY" format
+            zip_city = str(row["ZIP CODE / CITY"]).strip()
+            # Extract only the numeric part (postal code) - usually first 4 digits
+            postcode_match = re.match(r'(\d{4})', zip_city)
+            postcode = postcode_match.group(1) if postcode_match else zip_city[:4]
+
+            print(f"📮 Extracted postal code: '{postcode}' from '{zip_city}'")
+
+            # Skip if name is empty or NaN
+            if not name or name.lower() in ['nan', 'none', '']:
+                phone_numbers.append("-")
                 continue
 
-            print(f"ℹ️ Processing {index + 1}/{len(df)}: {name}")
+            print(f"\n📋 Processing {index + 1}/{len(df)}: {name} (Zip: {postcode})")
 
-            # Periodic ad check (every 5 searches)
-            if index % 5 == 0 and index > 0:
-                print("ℹ️ Periodic ad check...")
-                if check_for_blocking_elements(driver):
-                    detect_and_close_ad(driver)
-                    time.sleep(1)
+            # Check if phone number already exists
+            if pd.notna(row.get("TELEPHONE")) and str(row.get("TELEPHONE")).strip() and str(row.get("TELEPHONE")).strip() != "-":
+                existing_phone = str(row["TELEPHONE"]).strip()
+                print(f"✅ Phone number already exists: {existing_phone}")
+                phone_numbers.append(existing_phone)
+                continue
 
             phone_number = get_phone_number(name, postcode)
             phone_numbers.append(phone_number)
-            print(f"   Found: {phone_number if phone_number else 'nothing'}")
 
-            time.sleep(random.uniform(2, 4))  # random delay to avoid looking like a bot
+            print(f"📞 Result: {phone_number if phone_number else 'No phone found'}")
 
-        # Write the results back into the file
-        ws = wb[sheet_name]
-        if len(phone_numbers) == len(df):
-            telephone_col_idx = df.columns.get_loc("TELEPHONE") + 1
-            for i, value in enumerate(phone_numbers, start=2):  # row 1 is headers
-                ws.cell(row=i, column=telephone_col_idx, value=value)
-        else:
-            print(
-                f"⚠️ Number of phone numbers found ({len(phone_numbers)}) does not match "
-                f"the number of rows ({len(df)}) on sheet '{sheet_name}' - data NOT written"
-            )
+            # Random delay to avoid being detected as bot
+            time.sleep(random.uniform(2, 4))
 
-    # ============================================================
-    # 9. SAVE THE FILE
-    # ============================================================
+        # Update the worksheet with phone numbers
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+
+            # Find the TELEPHONE column
+            telephone_col = None
+            for col_idx, col in enumerate(df.columns, 1):
+                if col == "TELEPHONE":
+                    telephone_col = col_idx
+                    break
+
+            if telephone_col and len(phone_numbers) == len(df):
+                for i, value in enumerate(phone_numbers, start=2):  # Assuming row 1 contains headers
+                    ws.cell(row=i, column=telephone_col, value=value)
+                print(f"✅ Updated {len(phone_numbers)} phone numbers in sheet '{sheet_name}'")
+            else:
+                print(f"⚠️ Could not update sheet '{sheet_name}' - column mismatch")
+
+    except Exception as e:
+        print(f"❌ Error processing sheet '{sheet_name}': {e}")
+        continue
+
+# Save and close workbook
+try:
     wb.save(file_path)
     wb.close()
-    print("✅ File saved with phone numbers")
+    print(f"\n💾 Workbook saved successfully")
 
-    # Rename the file, adding " (T)" to the end of the name
+    # Create a copy with (T) suffix
     file_dir, file_name = os.path.split(file_path)
     file_base, file_ext = os.path.splitext(file_name)
+
     new_file_name = f"{file_base} (T){file_ext}"
     new_file_path = os.path.join(file_dir, new_file_name)
 
-    if os.path.exists(new_file_path):
-        # If a file with this name already exists (script run again) - don't
-        # crash, instead add a timestamp so nothing gets overwritten or fails
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        new_file_name = f"{file_base} (T) {timestamp}{file_ext}"
-        new_file_path = os.path.join(file_dir, new_file_name)
-        print(f"ℹ️ A file with this name already exists, saving as: {new_file_name}")
-
     os.rename(file_path, new_file_path)
-    print(f"✅ Finished file: {new_file_path}")
+
+    print(f"✅ SUCCESS: Phone numbers added and file saved as: {new_file_name}")
 
 except Exception as e:
-    print(f"❌ Error while processing phone numbers: {e}")
-    raise
+    print(f"❌ Error saving workbook: {e}")
 
-finally:
-    # Regardless of success or failure - always close the browser,
-    # otherwise the Chrome process could stay hanging in memory.
-    driver.quit()
-    print("ℹ️ ChromeDriver closed")
+# Quit Selenium driver
+driver.quit()
+print("🔄 Browser closed. Process completed!")
+
