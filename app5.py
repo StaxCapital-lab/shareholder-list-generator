@@ -5,7 +5,7 @@ What this program does (overview):
 1. Logs into aksjeeiere.no via Selenium and downloads xlsx files with each
    company's shareholder list for every year (2014 -> current year - 1).
 2. Processes all downloaded xlsx files, merges them into a single Excel
-   report based on the Template(original).xlsx template, and calculates
+   report based on the Template(2026.10.14.).xlsx template, and calculates
    year-over-year changes in share ownership.
 3. (Optional) adds phone numbers via a separate script, telephone.py.
 4. Displays everything through a simple Streamlit interface.
@@ -336,11 +336,11 @@ def write_data(company_name_input, session_folder):
         print("❌ No xlsx files in this session's folder - nothing to process")
         return 'This company has no shareholders'
 
-    template_path = os.path.join(os.getcwd(), 'Template(original).xlsx')
+    template_path = os.path.join(os.getcwd(), 'Template(2026.10.14.).xlsx')
     if not os.path.exists(template_path):
         raise FileNotFoundError(
             f"Template file not found: {template_path}. "
-            "Make sure 'Template(original).xlsx' is in the same folder as the program."
+            "Make sure 'Template(2026.10.14.).xlsx' is in the same folder as the program."
         )
 
     book = load_workbook(template_path)
