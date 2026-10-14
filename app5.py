@@ -629,7 +629,7 @@ def delete_session_folder(session_folder, max_attempts=5, delay_seconds=1):
 # ============================================================
 # 7. STREAMLIT UI
 # ============================================================
-st.title("Excel template maker")
+st.title("Shareholder List Generator")
 
 company_name_input = st.text_input("Enter Company Name:")
 include_phone_numbers = st.checkbox("Include Telephone Numbers")
