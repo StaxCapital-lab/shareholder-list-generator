@@ -1,38 +1,3 @@
-"""
-Excel Template Maker — Shareholder Lists Generator
-====================================================
-What this program does (overview):
-1. Logs into aksjeeiere.no via Selenium and downloads xlsx files with each
-   company's shareholder list for every year (2014 -> current year - 1).
-2. Processes all downloaded xlsx files, merges them into a single Excel
-   report based on the Template(2026.10.14.).xlsx template, and calculates
-   year-over-year changes in share ownership.
-3. (Optional) adds phone numbers via a separate script, telephone.py.
-4. Displays everything through a simple Streamlit interface.
-
-app3.py version notes:
-- Fixed a bug that crashed on int(' ') in the SEC.NR. / ORG.NR. column.
-- ChromeDriver is now selected automatically (webdriver-manager) + headless
-  mode, which is required to run on a server.
-- Added more checks and debug messages at "fragile" points in the code
-  (empty files, missing columns, non-numeric values, etc.).
-- Code split into sections with comments for easier navigation.
-- CONCURRENCY FIX: every run now uses its own isolated session folder
-  (sessions/<session_id>/) instead of one shared "files1" folder for
-  everyone. This means several people can use the app on the server at the
-  same time without their downloaded files, reports, or cleanup steps
-  interfering with each other's data. Chrome now also downloads directly
-  into that session folder, instead of relying on the shared system
-  Downloads folder (which is what made concurrent runs unsafe before).
-- Added a "Download report" button so the finished file can be downloaded
-  straight from the browser once the server has generated it, instead of
-  needing to be located on the server's disk.
-- Login credentials are now read from environment variables instead of
-  being hardcoded in the source (set AKSJEEIERE_EMAIL / AKSJEEIERE_PASSWORD,
-  e.g. via a .env file).
-- All comments and interface text translated to English.
-"""
-
 # ============================================================
 # 1. IMPORTS
 # ============================================================
@@ -679,17 +644,40 @@ if st.button("Search and Download"):
                             print(f"❌ Telephone script error: {result.stderr}")
                         else:
                             print("✅ Telephone extraction completed successfully")
-                            # telephone.py saves the result under the same name
-                            # plus a " (T)" suffix - point the download button
-                            # at that file instead of the original.
-                            base_name = os.path.splitext(os.path.basename(_file_pathexcel))[0]
-                            renamed_matches = sorted(
-                                glob.glob(os.path.join(session_folder, f"{base_name} (T)*.xlsx")),
+
+                        # Figure out which file to actually offer for
+                        # download by checking what's really on disk,
+                        # instead of trusting telephone.py's reported exit
+                        # code or guessing its exact renamed filename.
+                        # telephone.py can occasionally report success (exit
+                        # 0) even when its own save/rename step quietly
+                        # failed inside its own try/except - checking disk
+                        # state directly is immune to that.
+                        t_matches = sorted(
+                            glob.glob(os.path.join(session_folder, "* (T)*.xlsx")),
+                            key=os.path.getmtime,
+                            reverse=True,
+                        )
+                        if t_matches:
+                            # A "(T)" (with-phone-numbers) file exists - use it.
+                            _file_pathexcel = t_matches[0]
+                        elif not os.path.exists(_file_pathexcel):
+                            # Neither the original nor a "(T)" file exists -
+                            # last resort: use whichever .xlsx is actually
+                            # in the session folder, if any.
+                            print(f"⚠️ Expected file missing: {_file_pathexcel} - looking for any .xlsx in session folder")
+                            any_xlsx = sorted(
+                                glob.glob(os.path.join(session_folder, "*.xlsx")),
                                 key=os.path.getmtime,
                                 reverse=True,
                             )
-                            if renamed_matches:
-                                _file_pathexcel = renamed_matches[0]
+                            if any_xlsx:
+                                _file_pathexcel = any_xlsx[0]
+                                print(f"ℹ️ Falling back to: {_file_pathexcel}")
+                            else:
+                                print("❌ No .xlsx file found in session folder at all")
+                        # else: original file still exists and no "(T)"
+                        # version was made - keep using the original path.
 
                 st.success("Processing completed successfully!")
 
