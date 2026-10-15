@@ -163,6 +163,43 @@ except Exception as e:
     driver.quit()
     sys.exit(1)
 
+def is_driver_alive():
+    """Checks whether the current Chrome session is still responding -
+    used to tell a page-level problem (name not found, etc.) apart from
+    the whole browser process having crashed."""
+    try:
+        _ = driver.current_url
+        return True
+    except Exception:
+        return False
+
+
+def recreate_driver():
+    """
+    Starts a fresh Chrome instance after a crash (the browser process can
+    occasionally die mid-run, for reasons that don't show up as an OOM
+    kill or any other clear system-level cause) and re-does the initial
+    1881.no load + consent popup, so processing can continue from a clean
+    browser instead of every subsequent lookup failing the same way.
+    """
+    global driver
+    print("🔁 Chrome appears to have crashed - starting a new browser instance...")
+    try:
+        if driver is not None:
+            driver.quit()
+    except Exception:
+        pass
+
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()), options=options
+    )
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    driver.get("https://www.1881.no/")
+    time.sleep(random.uniform(3, 6))
+    handle_consent_popup()
+    print("✅ New Chrome instance ready - resuming")
+
+
 def handle_consent_popup():
     """Handle the consent popup that appears on 1881.no"""
     print("\n🔍 HANDLING CONSENT POPUP...")
@@ -608,6 +645,16 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
     except Exception as e:
         print(f"❌ Error during phone extraction: {e}")
 
+        # If the browser process itself crashed (not just a page-level
+        # problem), the same error would repeat for every remaining
+        # person unless we start a new Chrome instance first.
+        if not is_driver_alive():
+            try:
+                recreate_driver()
+            except Exception as recreate_error:
+                print(f"❌ Could not recreate Chrome driver: {recreate_error}")
+                return "-"
+
         # Retry on error
         if retry_count < max_retries:
             print(f"🔄 Retrying after error (attempt {retry_count + 1}/{max_retries})...")
@@ -738,6 +785,13 @@ try:
 except Exception as e:
     print(f"❌ Error saving workbook: {e}")
 
-# Quit Selenium driver
-driver.quit()
+# Quit Selenium driver. Guarded: by this point the workbook is already
+# saved and renamed, so a hiccup while closing the browser must not turn
+# an otherwise-successful run into a reported failure (which previously
+# left app5.py pointing at the old, now-renamed, file path).
+try:
+    driver.quit()
+except Exception as e:
+    print(f"⚠️ Error while closing browser (ignored, run already completed): {e}")
+
 print("🔄 Browser closed. Process completed!")
