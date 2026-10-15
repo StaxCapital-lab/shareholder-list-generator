@@ -672,6 +672,8 @@ if st.button("Search and Download"):
                                 [sys.executable, telephone_script, _file_pathexcel],
                                 capture_output=True, text=True, encoding="utf-8", errors="replace"
                             )
+                        print(result.stdout)
+                        print(result.stderr)
                         if result.returncode != 0:
                             st.error(f"Telephone extraction failed: {result.stderr}")
                             print(f"❌ Telephone script error: {result.stderr}")
