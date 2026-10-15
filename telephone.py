@@ -18,10 +18,12 @@ else:
 import time
 import pandas as pd
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 import re
 from openpyxl import load_workbook
@@ -39,10 +41,11 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 file_path = sys.argv[1]  # dynamically gets the correct file path from app.py
-sheets = ["Private 2024", "Selskap 2024"]  # Sheets to process
-# "Selskap 2024" is kept in the workbook for feature parity, but company
-# shareholders are intentionally NOT searched on 1881. Their pages use a
-# different layout/URL and this lookup is person-only.
+sheets = ["Private 2024"]  # Only private individuals.
+# NOTE: company lookups ("Selskap 2024") were tried and removed again -
+# 1881.no opens a company page at a different URL pattern (no "/person/"
+# in it), which this script doesn't know how to read, so it always came
+# back empty anyway. Easier to just not search for companies here at all.
 
 # Setup logging for debugging. The log file is written next to the input
 # Excel file (inside this run's own session folder) instead of a single
@@ -135,11 +138,9 @@ def _cleanup():
 atexit.register(_cleanup)
 
 try:
-    # Selenium 4.6+ includes Selenium Manager, which automatically
-    # finds/downloads the ChromeDriver matching the installed Chrome.
-    # Do NOT use webdriver-manager here: its global /root/.wdm lock
-    # causes concurrent users to block each other.
-    driver = webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()), options=options
+    )
 
     # Hide webdriver property
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -205,52 +206,45 @@ def handle_consent_popup():
         print(f"❌ Error handling consent popup: {e}")
         return False
 
-def normalize_name(name):
-    """Normalize a name for robust comparison.
-
-    We compare individual words rather than requiring the exact string,
-    because 1881 can display names in a different order or with small
-    formatting differences.
-    """
-    if not name:
-        return []
-    name = re.sub(r"[^\wæøåÆØÅ-]+", " ", str(name), flags=re.UNICODE).lower()
-    return [part for part in name.split() if part]
-
-
-def verify_person_match(page_name, search_name, zip_code=None):
-    """Return True when the displayed person name matches the searched name.
-
-    All words from the searched name must be present in the displayed name,
-    allowing the order to differ. This prevents accidentally accepting a
-    relative/person with the same surname.
-    """
+def verify_person_match(page_name, search_name, zip_code):
+    """Verify if the person on the page matches the search criteria"""
     try:
-        page_words = normalize_name(page_name)
-        search_words = normalize_name(search_name)
+        # Normalize names for comparison
+        page_name_normalized = page_name.lower().strip()
+        search_name_normalized = search_name.lower().strip()
 
-        if not page_words or not search_words:
-            return False
-
-        page_set = set(page_words)
-        search_set = set(search_words)
-
-        name_match = search_set.issubset(page_set)
+        # Check if names match (allow for slight variations)
+        name_match = (search_name_normalized in page_name_normalized or
+                     page_name_normalized in search_name_normalized or
+                     search_name_normalized.split()[0] in page_name_normalized)
 
         if not name_match:
-            print(
-                f"⚠️ Name mismatch: expected '{search_name}', "
-                f"found '{page_name}'"
-            )
+            print(f"⚠️ Name mismatch: expected '{search_name}', found '{page_name}'")
             return False
 
         print(f"✅ Name match confirmed: '{page_name}'")
         return True
 
     except Exception as e:
-        # Do NOT accept the result if verification itself fails.
         print(f"⚠️ Could not verify person match: {e}")
+        return True  # Continue anyway if verification fails
+
+def names_match(candidate_text, search_name):
+    """
+    Checks whether a search-result's visible text (name, possibly plus age
+    and city, e.g. "Christopher Heidenreich, 34, Oslo") contains every word
+    of the name we're searching for - regardless of word order. Used to
+    pick the correct result out of several, instead of always clicking the
+    first one on the list.
+    """
+    def words(text):
+        return set(re.findall(r"[a-zA-ZæøåÆØÅ]+", text.lower()))
+
+    search_words = words(search_name)
+    if not search_words:
         return False
+    candidate_words = words(candidate_text)
+    return search_words.issubset(candidate_words)
 
 
 def extract_postal_code_from_address(address_text):
@@ -329,102 +323,8 @@ def clean_phone_number(phone_number):
     # If not standard 8 digits, return as-is but cleaned
     return cleaned
 
-def get_search_result_links():
-    """Collect candidate person links from the current 1881 results page.
-
-    We deliberately only collect /person/ links. Company pages are ignored.
-    Returns a de-duplicated list of (element, href, visible_text).
-    """
-    selectors = [
-        "a[href*='/person/']",
-        ".search-result a[href*='/person/']",
-        ".result-item a[href*='/person/']",
-        "div[class*='result'] a[href*='/person/']",
-    ]
-
-    candidates = []
-    seen = set()
-
-    for selector in selectors:
-        try:
-            elements = WebDriverWait(driver, 5).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
-            )
-        except Exception:
-            continue
-
-        for elem in elements:
-            try:
-                href = elem.get_attribute("href") or ""
-                text_value = elem.text.strip()
-                if not href or "/person/" not in href:
-                    continue
-
-                key = href.split("#")[0]
-                if key in seen:
-                    continue
-
-                seen.add(key)
-                candidates.append((elem, href, text_value))
-            except Exception:
-                continue
-
-        if candidates:
-            # Keep the first selector that gives useful person links, but
-            # continue deduplicating from the other selectors if available.
-            continue
-
-    return candidates
-
-
-def print_search_page_diagnostics():
-    """Print useful information when 1881 gives an unexpected results page."""
-    try:
-        print("🔎 SEARCH PAGE DIAGNOSTICS")
-        print(f"📍 URL: {driver.current_url}")
-
-        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-        printed = 0
-        seen = set()
-
-        for link in links:
-            try:
-                href = link.get_attribute("href") or ""
-                text_value = " ".join(link.text.split())
-
-                if not href:
-                    continue
-
-                key = (href, text_value)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                # Print likely search/result links first, then a limited
-                # number of other links so logs stay manageable.
-                if (
-                    "/person/" in href
-                    or "/company/" in href
-                    or "#gsc" in href
-                    or "search" in href.lower()
-                ):
-                    print(f"   LINK: text='{text_value[:120]}' href='{href}'")
-                    printed += 1
-                    if printed >= 30:
-                        break
-            except Exception:
-                continue
-
-        if printed == 0:
-            print("   No likely result/search links found on the page.")
-
-        print(f"📄 Page title: {driver.title}")
-    except Exception as e:
-        print(f"⚠️ Could not print search page diagnostics: {e}")
-
-
 def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
-    """Extract phone number from a matching 1881 person page."""
+    """Extract phone number using the improved method with retry logic"""
     try:
         print(f"🔍 Searching for: {name} in postal code {zip_code}")
 
@@ -434,294 +334,285 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
         )
 
         # Clear and enter search term (include postal code in search)
-        search_term = f"{name} {zip_code}" if zip_code else name
+        search_term = f"{name} {zip_code}"
         search_input.clear()
         search_input.send_keys(search_term)
 
         # Submit search
         search_input.submit()
 
-        # Wait for navigation/results to settle
+        # Wait for search results to load
         time.sleep(3)
 
         current_url = driver.current_url
         print(f"📍 Current URL: {current_url}")
 
-        # ------------------------------------------------------------
-        # CASE 1: 1881 directly opened a person detail page.
-        # ------------------------------------------------------------
-        if "/person/" in current_url:
-            print("✅ 1881 directly opened a person detail page!")
+        # Check if we're on a search results page (not a person detail page yet)
+        if "/person/" not in current_url:
+            print("📋 On search results page, attempting to click first result...")
 
-        # ------------------------------------------------------------
-        # CASE 2: We are on a results/search page.
-        # Find ALL person results and choose the one matching the
-        # requested name, instead of blindly clicking the first result.
-        # ------------------------------------------------------------
-        else:
-            print("📋 On search/results page - looking for matching person...")
+            # Try to find and click the first search result
+            try:
+                # Wait for search results to appear with multiple selector options
+                result_selectors = [
+                    "a[href*='/person/']",
+                    ".search-result a",
+                    ".result-item a",
+                    "div[class*='result'] a"
+                ]
 
-            candidates = get_search_result_links()
-            print(f"👥 Found {len(candidates)} person result link(s)")
-
-            matching_candidate = None
-
-            for _, href, visible_text in candidates:
-                print(
-                    f"   Candidate: '{visible_text}' -> {href}"
-                )
-
-                # First use the visible result text as a quick filter.
-                if visible_text and verify_person_match(
-                    visible_text, name, zip_code
-                ):
-                    matching_candidate = href
-                    print(f"✅ Matching result selected: {href}")
-                    break
-
-                # If visible text is incomplete, open the candidate in the
-                # same tab and verify the actual person page name.
-                try:
-                    original_url = driver.current_url
-                    driver.get(href)
-                    time.sleep(2)
-
-                    candidate_url = driver.current_url
-                    if "/person/" not in candidate_url:
-                        driver.get(original_url)
-                        time.sleep(1)
+                all_results = []
+                for selector in result_selectors:
+                    try:
+                        WebDriverWait(driver, 5).until(
+                            EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
+                        )
+                        found = driver.find_elements(By.CSS_SELECTOR, selector)
+                        if found:
+                            all_results = found
+                            print(f"✅ Found {len(found)} result(s) with selector: {selector}")
+                            break
+                    except:
                         continue
 
-                    name_elements = driver.find_elements(
-                        By.CSS_SELECTOR, ".details-name, h1"
-                    )
-                    candidate_name = (
-                        name_elements[0].text.strip()
-                        if name_elements else ""
-                    )
-
-                    if verify_person_match(candidate_name, name, zip_code):
-                        matching_candidate = candidate_url
-                        print(
-                            f"✅ Matching person page selected: "
-                            f"{candidate_name}"
-                        )
-                        break
-
-                    driver.get(original_url)
-                    time.sleep(1)
-
-                except Exception as candidate_error:
-                    print(
-                        f"⚠️ Could not inspect candidate '{href}': "
-                        f"{candidate_error}"
-                    )
+                if not all_results:
+                    print("❌ Could not find any search results")
+                    # DIAGNOSTIC: log every link on the page, so cases like
+                    # a #gsc... Google-custom-search results page (different
+                    # markup our selectors don't match) can be inspected
+                    # afterwards instead of just guessing.
                     try:
-                        driver.back()
-                        time.sleep(1)
-                    except Exception:
-                        pass
+                        diag_links = driver.find_elements(By.TAG_NAME, "a")
+                        print(f"🔍 DIAGNOSTIC: page has {len(diag_links)} <a> links total. First 40:")
+                        for link in diag_links[:40]:
+                            href = link.get_attribute('href')
+                            text = link.text.strip()
+                            if href:
+                                print(f"   - [{text}] -> {href}")
+                    except Exception as diag_error:
+                        print(f"⚠️ Could not collect diagnostic links: {diag_error}")
+                    return "-"
 
-            if not matching_candidate:
-                print(
-                    f"❌ No person result matched '{name}' "
-                    f"in the search results."
-                )
-                print_search_page_diagnostics()
-                return "-"
+                # Among all results, skip company pages (their links don't
+                # contain "/person/") and pick the one whose visible name
+                # matches every word of the name we searched for - rather
+                # than always clicking the first result on the list.
+                chosen_result = None
+                for result in all_results:
+                    href = result.get_attribute('href') or ""
+                    if "/person/" not in href:
+                        continue  # company result - not handled here
+                    result_text = result.text.strip()
+                    if names_match(result_text, name):
+                        chosen_result = result
+                        print(f"✅ Name match in results list: '{result_text}' -> selecting this one")
+                        break
+                    else:
+                        print(f"⏭️ Skipping non-matching result: '{result_text}' ({href})")
 
-            # If the matching candidate was not already opened as a page,
-            # navigate to it now.
-            if "/person/" not in driver.current_url or (
-                matching_candidate != driver.current_url
-            ):
-                driver.get(matching_candidate)
+                if chosen_result is None:
+                    print(f"❌ None of the {len(all_results)} result(s) matched the name '{name}'")
+                    # DIAGNOSTIC: log what was actually on the results list,
+                    # so a mismatch (wrong site layout, company-only
+                    # results, etc.) can be diagnosed from the log.
+                    for result in all_results:
+                        href = result.get_attribute('href') or ""
+                        print(f"   - candidate: '{result.text.strip()}' -> {href}")
+                    return "-"
+
+                print(f"🔗 Clicking matched result link: {chosen_result.get_attribute('href')}")
+
+                # Click the matched result
+                driver.execute_script("arguments[0].click();", chosen_result)
+
+                # Wait for person detail page to load
                 time.sleep(3)
 
-            current_url = driver.current_url
-            print(f"📍 Selected person URL: {current_url}")
+                # Verify we're now on a person page
+                current_url = driver.current_url
+                print(f"📍 After click - Current URL: {current_url}")
 
-            if "/person/" not in current_url:
-                print("❌ Selected result is not a person detail page")
-                print_search_page_diagnostics()
-                return "-"
+                if "/person/" not in current_url:
+                    print("❌ Failed to navigate to person detail page after clicking")
+                    return "-"
 
-        # ------------------------------------------------------------
-        # Verify the person page one more time before extracting a phone.
-        # ------------------------------------------------------------
-        print("✅ Successfully navigated to person detail page!")
-
-        try:
-            name_elements = driver.find_elements(
-                By.CSS_SELECTOR, ".details-name, h1"
-            )
-            page_name = (
-                name_elements[0].text.strip()
-                if name_elements else ""
-            )
-
-            print(f"👤 Found person: {page_name}")
-
-            if not page_name or not verify_person_match(
-                page_name, name, zip_code
-            ):
-                print("❌ Person verification failed")
-                return "-"
-        except Exception as e:
-            print(f"⚠️ Could not verify person name: {e}")
-            # Safety first: do not return a phone from an unverified page.
-            return "-"
-
-        # Look for postal code in the address
-        try:
-            address_elements = driver.find_elements(
-                By.CSS_SELECTOR,
-                ".listing-address, .address, .location"
-            )
-            address_found = False
-            found_postal_codes = []
-
-            for addr_elem in address_elements:
-                address_text = addr_elem.text
-                print(f"📍 Found address: {address_text}")
-
-                extracted_zip = extract_postal_code_from_address(address_text)
-                if extracted_zip:
-                    found_postal_codes.append(extracted_zip)
-                    print(f"   Extracted postal code: {extracted_zip}")
-
-                if zip_code and zip_code in address_text:
-                    print(f"✅ Postal code {zip_code} confirmed in address!")
-                    address_found = True
-                    break
-
-            # If the site does not expose the address in those selectors,
-            # fall back to the full page source.
-            if not address_found and zip_code and zip_code in driver.page_source:
-                print(f"✅ Postal code {zip_code} found in page source!")
-                address_found = True
-
-            # Only enforce postal-code matching when a postcode was supplied.
-            if zip_code and not address_found:
-                print(f"⚠️ Could not confirm postal code {zip_code}")
-                print(f"   Found postal codes on page: {found_postal_codes}")
-                return "-"
-        except Exception as e:
-            print(f"⚠️ Could not check address: {e}")
-            if zip_code:
-                return "-"
-
-        # Now extract phone number
-        print("📞 Looking for phone number...")
-
-        page_postal_codes = get_all_postal_codes_on_page()
-        print(f"📍 Postal codes found on page: {page_postal_codes}")
-
-        # Strategy 1: Look for phone links
-        try:
-            phone_links = driver.find_elements(By.CSS_SELECTOR, "a[href^='tel:']")
-            print(f"📞 Found {len(phone_links)} phone link(s)")
-
-            for i, link in enumerate(phone_links):
-                phone_href = link.get_attribute("href")
-                phone_number = phone_href.replace("tel:", "").strip()
-                if phone_number:
-                    cleaned_phone = clean_phone_number(phone_number)
-                    print(f"📞 Phone link {i+1}: {cleaned_phone}")
-
-                    if zip_code and zip_code not in page_postal_codes:
-                        print(
-                            f"⚠️ Skipping phone {cleaned_phone} - "
-                            f"postal code {zip_code} not found on page"
-                        )
-                        continue
-
-                    print(f"✅ Returning phone number: {cleaned_phone}")
-                    return cleaned_phone
-        except Exception as e:
-            print(f"⚠️ Error processing phone links: {e}")
-
-        # Strategy 2: Look for phone in specific elements
-        phone_selectors = [
-            ".button-call__number",
-            ".contact-featured__call",
-            ".phone",
-            ".telephone",
-            ".tlf",
-            ".mobil",
-            ".contact-phone"
-        ]
-
-        for selector in phone_selectors:
-            try:
-                phone_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                print(
-                    f"📞 Found {len(phone_elements)} element(s) "
-                    f"with selector '{selector}'"
-                )
-
-                for i, elem in enumerate(phone_elements):
-                    phone_text = elem.text.strip()
-                    if phone_text and re.search(r'\d', phone_text):
-                        phone_clean = re.sub(r'[^\d\+\s]', '', phone_text)
-                        if len(phone_clean.replace(' ', '')) >= 8:
-                            cleaned_phone = clean_phone_number(phone_clean)
-                            print(f"📞 Phone element {i+1}: {cleaned_phone}")
-
-                            if zip_code and zip_code not in page_postal_codes:
-                                print(
-                                    f"⚠️ Skipping phone {cleaned_phone} - "
-                                    f"postal code {zip_code} not found on page"
-                                )
-                                continue
-
-                            print(
-                                f"📍 Postal code {zip_code} confirmed on page"
-                            )
-                            print(f"✅ Returning phone number: {cleaned_phone}")
-                            return cleaned_phone
             except Exception as e:
-                print(f"⚠️ Error with selector '{selector}': {e}")
-                continue
+                print(f"❌ Error clicking first result: {e}")
+                return "-"
 
-        # Strategy 3: Look for phone in page text using regex
-        page_text = driver.page_source
+        # Now we should be on a person detail page
+        if "/person/" in current_url:
+            print("✅ Successfully navigated to person detail page!")
+            
+            # Verify this is the correct person by checking the name
+            try:
+                name_element = driver.find_element(By.CSS_SELECTOR, ".details-name, h1")
+                page_name = name_element.text.strip()
+                print(f"👤 Found person: {page_name}")
 
-        phone_patterns = [
-            r'(\+47\s?)?(\d{2}\s?\d{2}\s?\d{2}\s?\d{2})',
-            r'(\+47\s?)?\d{8}',
-            r'tel:(\+47)?(\d{8})',
-        ]
+                # Verify the person matches our search criteria
+                if not verify_person_match(page_name, name, zip_code):
+                    print(f"❌ Person verification failed")
+                    return "-"
+            except:
+                print("⚠️ Could not verify person name")
+            
+            # Look for postal code in the address
+            try:
+                address_elements = driver.find_elements(By.CSS_SELECTOR, ".listing-address, .address, .location")
+                address_found = False
+                found_postal_codes = []
 
-        for pattern in phone_patterns:
-            matches = re.findall(pattern, page_text)
-            for match in matches:
-                if isinstance(match, tuple):
-                    phone_number = ''.join(match)
-                else:
-                    phone_number = match
+                for addr_elem in address_elements:
+                    address_text = addr_elem.text
+                    print(f"📍 Found address: {address_text}")
 
-                phone_clean = re.sub(r'[^\d\+]', '', phone_number)
-                if len(phone_clean) >= 8:
-                    cleaned_phone = clean_phone_number(phone_clean)
-                    print(f"📞 Found phone number with regex: {cleaned_phone}")
-                    return cleaned_phone
+                    # Extract postal code from address
+                    extracted_zip = extract_postal_code_from_address(address_text)
+                    if extracted_zip:
+                        found_postal_codes.append(extracted_zip)
+                        print(f"   Extracted postal code: {extracted_zip}")
 
-        print("❌ No phone number found on person page")
-        return "-"
+                    # Check if postal code is in the address
+                    if zip_code in address_text:
+                        print(f"✅ Postal code {zip_code} confirmed in address!")
+                        address_found = True
+                        break
+
+                if not address_found:
+                    # Check page source for postal code
+                    if zip_code in driver.page_source:
+                        print(f"✅ Postal code {zip_code} found in page source!")
+                        address_found = True
+
+                if not address_found:
+                    print(f"⚠️ Could not confirm postal code {zip_code}")
+                    print(f"   Found postal codes on page: {found_postal_codes}")
+                    return "-"
+            except:
+                print("⚠️ Could not check address")
+            
+            # Now extract phone number
+            print("📞 Looking for phone number...")
+
+            # Get all postal codes on the page first
+            page_postal_codes = get_all_postal_codes_on_page()
+            print(f"📍 Postal codes found on page: {page_postal_codes}")
+
+            # Strategy 1: Look for phone links
+            try:
+                phone_links = driver.find_elements(By.CSS_SELECTOR, "a[href^='tel:']")
+                print(f"📞 Found {len(phone_links)} phone link(s)")
+
+                for i, link in enumerate(phone_links):
+                    phone_href = link.get_attribute('href')
+                    phone_number = phone_href.replace('tel:', '').strip()
+                    if phone_number:
+                        cleaned_phone = clean_phone_number(phone_number)
+                        print(f"📞 Phone link {i+1}: {cleaned_phone}")
+
+                        # Verify postal code match if we have a zip code to verify
+                        if zip_code:
+                            # Check if the expected postal code is on the page
+                            if zip_code not in page_postal_codes:
+                                print(f"⚠️ Skipping phone {cleaned_phone} - postal code {zip_code} not found on page")
+                                continue
+                            else:
+                                print(f"✅ Postal code {zip_code} confirmed on page")
+
+                        print(f"✅ Returning phone number: {cleaned_phone}")
+                        return cleaned_phone
+            except Exception as e:
+                print(f"⚠️ Error processing phone links: {e}")
+            
+            # Strategy 2: Look for phone in specific elements
+            phone_selectors = [
+                ".button-call__number",
+                ".contact-featured__call",
+                ".phone",
+                ".telephone",
+                ".tlf",
+                ".mobil",
+                ".contact-phone"
+            ]
+
+            for selector in phone_selectors:
+                try:
+                    phone_elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    print(f"📞 Found {len(phone_elements)} element(s) with selector '{selector}'")
+
+                    for i, elem in enumerate(phone_elements):
+                        phone_text = elem.text.strip()
+                        if phone_text and re.search(r'\d', phone_text):
+                            # Clean up phone number
+                            phone_clean = re.sub(r'[^\d\+\s]', '', phone_text)
+                            if len(phone_clean.replace(' ', '')) >= 8:  # Norwegian phone numbers are 8 digits
+                                cleaned_phone = clean_phone_number(phone_clean)
+                                print(f"📞 Phone element {i+1}: {cleaned_phone}")
+
+                                # Verify postal code match if we have a zip code to verify
+                                if zip_code:
+                                    # Check if the expected postal code is on the page
+                                    if zip_code not in page_postal_codes:
+                                        print(f"⚠️ Skipping phone {cleaned_phone} - postal code {zip_code} not found on page")
+                                        continue
+                                    else:
+                                        print(f"✅ Postal code {zip_code} confirmed on page")
+
+                                print(f"✅ Returning phone number: {cleaned_phone}")
+                                return cleaned_phone
+                except Exception as e:
+                    print(f"⚠️ Error with selector '{selector}': {e}")
+                    continue
+            
+            # Strategy 3: Look for phone in page text using regex
+            page_text = driver.page_source
+            
+            # Norwegian phone number patterns
+            phone_patterns = [
+                r'(\+47\s?)?(\d{2}\s?\d{2}\s?\d{2}\s?\d{2})',  # +47 XX XX XX XX or XX XX XX XX
+                r'(\+47\s?)?\d{8}',  # +47XXXXXXXX or XXXXXXXX
+                r'tel:(\+47)?(\d{8})',  # tel: links
+            ]
+            
+            for pattern in phone_patterns:
+                matches = re.findall(pattern, page_text)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        phone_number = ''.join(match)
+                    else:
+                        phone_number = match
+                    
+                    # Clean and validate
+                    phone_clean = re.sub(r'[^\d\+]', '', phone_number)
+                    if len(phone_clean) >= 8:
+                        cleaned_phone = clean_phone_number(phone_clean)
+                        print(f"📞 Found phone number with regex: {cleaned_phone}")
+                        return cleaned_phone
+            
+            print("❌ No phone number found on person page")
+            return "-"
+            
+        else:
+            print("❌ Did not reach person detail page")
+            print("📋 Current page might be search results or error page")
+
+            # Retry with just the name (without postal code)
+            if retry_count < max_retries:
+                print(f"🔄 Retrying with just name (attempt {retry_count + 1}/{max_retries})...")
+                time.sleep(2)
+                return get_phone_number(name, "", retry_count + 1, max_retries)
+
+            return "-"
 
     except Exception as e:
         print(f"❌ Error during phone extraction: {e}")
 
+        # Retry on error
         if retry_count < max_retries:
-            print(
-                f"🔄 Retrying after error "
-                f"(attempt {retry_count + 1}/{max_retries})..."
-            )
+            print(f"🔄 Retrying after error (attempt {retry_count + 1}/{max_retries})...")
             time.sleep(3)
-            return get_phone_number(
-                name, zip_code, retry_count + 1, max_retries
-            )
+            return get_phone_number(name, zip_code, retry_count + 1, max_retries)
 
         return "-"
 
@@ -782,14 +673,6 @@ for sheet_name in sheets:
             postcode = postcode_match.group(1) if postcode_match else zip_city[:4]
 
             print(f"📮 Extracted postal code: '{postcode}' from '{zip_city}'")
-
-            # Company shareholders are intentionally not searched on 1881.
-            # The current phone lookup is person-only; company result pages
-            # use a different URL/layout and must not be mistaken for people.
-            if sheet_name == "Selskap 2024":
-                phone_numbers.append("-")
-                print(f"🏢 Skipping company lookup: {name}")
-                continue
 
             # Skip if name is empty or NaN
             if not name or name.lower() in ['nan', 'none', '']:
