@@ -371,14 +371,7 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
         )
 
         # Clear and enter search term (include postal code in search)
-        # Search by name only. Appending the postal code here used to
-        # confuse 1881.no's own search - instead of showing a normal list
-        # of name candidates, it would sometimes jump straight to an
-        # unrelated "closest match" person (e.g. a relative with the same
-        # surname at a similar address). The postal code is still checked
-        # further down, once we're on a candidate's actual page, so this
-        # doesn't weaken the "wrong person" protection.
-        search_term = name
+        search_term = f"{name} {zip_code}"
         search_input.clear()
         search_input.send_keys(search_term)
 
@@ -802,4 +795,3 @@ except Exception as e:
     print(f"⚠️ Error while closing browser (ignored, run already completed): {e}")
 
 print("🔄 Browser closed. Process completed!")
-
