@@ -311,7 +311,7 @@ def write_data(company_name_input, session_folder):
     book = load_workbook(template_path)
     print('✅ Excel template loaded')
 
-    sheet_name = 'Private & Selskap 2014 - 2024'
+    sheet_name = 'Private & Selskap'
     if sheet_name not in book.sheetnames:
         raise ValueError(f"Template is missing sheet '{sheet_name}'. Available sheets: {book.sheetnames}")
 
@@ -509,15 +509,15 @@ def write_data(company_name_input, session_folder):
     book.save(output_path)
 
     with pd.ExcelWriter(output_path, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-        df_private.to_excel(writer, sheet_name="Private 2024", index=False)
-        df_selskap.to_excel(writer, sheet_name="Selskap 2024", index=False)
-        template_df.to_excel(writer, sheet_name="Private & Selskap 2014 - 2024", index=False)
+        df_private.to_excel(writer, sheet_name="Private", index=False)
+        df_selskap.to_excel(writer, sheet_name="Selskap", index=False)
+        template_df.to_excel(writer, sheet_name="Private & Selskap", index=False)
 
-    _apply_wrap_text(output_path, ["Private 2024", "Selskap 2024", "Private & Selskap 2014 - 2024"])
+    _apply_wrap_text(output_path, ["Private", "Selskap", "Private & Selskap"])
 
     # --- 5.7 Per-year summary on the "Analyse" sheet ---
     wb = load_workbook(output_path)
-    df_private_selskap = pd.read_excel(output_path, sheet_name="Private & Selskap 2014 - 2024")
+    df_private_selskap = pd.read_excel(output_path, sheet_name="Private & Selskap")
 
     # Guard against the same bug: clean up non-numeric values before grouping/summing
     df_private_selskap['YEAR'] = pd.to_numeric(df_private_selskap['YEAR'], errors='coerce')
