@@ -332,9 +332,16 @@ class BlockedBySite(Exception):
     """1881.no showed its captcha / 'Blokkert' page."""
 
 
-def is_blocked():
+def is_captcha():
     try:
-        return "/captcha" in driver.current_url or driver.title.strip().lower() == "blokkert"
+        return "/captcha" in driver.current_url.lower()
+    except Exception:
+        return False
+
+
+def is_hard_blocked():
+    try:
+        return driver.title.strip().lower() == "blokkert"
     except Exception:
         return False
 
@@ -402,9 +409,22 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
     try:
         print(f"🔍 Searching for: {name} in postal code {zip_code}")
 
-        if is_blocked():
+        if is_hard_blocked():
             raise BlockedBySite()
-        wait_for_turn()
+
+        if is_captcha():
+            rint(f"⚠️ CAPTCHA detected for '{name}'")
+            print(f"   CAPTCHA URL: {driver.current_url}")
+            print("   Skipping this person and continuing with the next one.")
+
+        try:
+            driver.get("https://www.1881.no/")
+            time.sleep(random.uniform(3, 5))
+        except Exception as e:
+            print(f"⚠️ Could not return to 1881 homepage: {e}")
+
+        return "-"
+            wait_for_turn()
 
         search_input = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search']"))
@@ -413,6 +433,18 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
         search_input.send_keys(f"{name} {zip_code}")
         search_input.submit()
         time.sleep(3)
+        if is_captcha():
+            print(f"⚠️ CAPTCHA detected for '{name}'")
+            print(f"   CAPTCHA URL: {driver.current_url}")
+            print("   Skipping this person and continuing with the next one.")
+
+        try:
+            driver.get("https://www.1881.no/")
+            time.sleep(random.uniform(3, 5))
+        except Exception as e:
+            print(f"⚠️ Could not return to 1881 homepage: {e}")
+
+        return "-"
 
         if is_blocked():
             raise BlockedBySite()
