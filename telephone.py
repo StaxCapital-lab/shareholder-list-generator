@@ -424,7 +424,7 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
             print(f"⚠️ Could not return to 1881 homepage: {e}")
 
         return "-"
-            wait_for_turn()
+        wait_for_turn()
 
         search_input = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search']"))
