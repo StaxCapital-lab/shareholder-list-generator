@@ -310,7 +310,7 @@ def write_data(company_name_input, session_folder):
     book = load_workbook(template_path)
     print('✅ Excel template loaded')
 
-    sheet_name = 'Private & Selskap'
+    sheet_name = 'Private & Selskap '
     if sheet_name not in book.sheetnames:
         raise ValueError(f"Template is missing sheet '{sheet_name}'. Available sheets: {book.sheetnames}")
 
@@ -334,15 +334,15 @@ def write_data(company_name_input, session_folder):
         print(f"ℹ️ Processing file [{idx + 1}/{len(excel_files)}]: {aksjeeiere_path}")
         aksjeeiere_df = pd.read_excel(aksjeeiere_path)
 
-        if 'Selskap' not in aksjeeiere_df.columns:
+        if 'Selskap ' not in aksjeeiere_df.columns:
             print(f"⚠️ File {aksjeeiere_path} has no 'Selskap' column, skipping file")
             continue
 
-        available_companies = aksjeeiere_df['Selskap'].unique()
+        available_companies = aksjeeiere_df['Selskap '].unique()
         print(f"   Companies in file: {list(available_companies)}")
         print(f"   Looking for: {company_name}")
 
-        aksjeeiere_df = aksjeeiere_df[aksjeeiere_df['Selskap'].apply(normalize_company_name) == company_name]
+        aksjeeiere_df = aksjeeiere_df[aksjeeiere_df['Selskap '].apply(normalize_company_name) == company_name]
         print(f"   Rows found: {aksjeeiere_df.shape[0]}")
 
         if aksjeeiere_df.empty:
@@ -353,7 +353,7 @@ def write_data(company_name_input, session_folder):
 
         # If a company name wasn't explicitly entered - take it from the first matching row
         if not company_name_input:
-            company_name = str(aksjeeiere_df['Selskap'].iloc[0]).replace(' ', '_').replace('/', '_')
+            company_name = str(aksjeeiere_df['Selskap '].iloc[0]).replace(' ', '_').replace('/', '_')
 
         # Build a temporary table with columns in the template's format
         temp_df = pd.DataFrame()
@@ -508,15 +508,15 @@ def write_data(company_name_input, session_folder):
     book.save(output_path)
 
     with pd.ExcelWriter(output_path, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-        df_private.to_excel(writer, sheet_name="Private", index=False)
-        df_selskap.to_excel(writer, sheet_name="Selskap", index=False)
-        template_df.to_excel(writer, sheet_name="Private & Selskap", index=False)
+        df_private.to_excel(writer, sheet_name="Private ", index=False)
+        df_selskap.to_excel(writer, sheet_name="Selskap ", index=False)
+        template_df.to_excel(writer, sheet_name="Private & Selskap ", index=False)
 
-    _apply_wrap_text(output_path, ["Private", "Selskap", "Private & Selskap"])
+    _apply_wrap_text(output_path, ["Private ", "Selskap ", "Private & Selskap "])
 
     # --- 5.7 Per-year summary on the "Analyse" sheet ---
     wb = load_workbook(output_path)
-    df_private_selskap = pd.read_excel(output_path, sheet_name="Private & Selskap")
+    df_private_selskap = pd.read_excel(output_path, sheet_name="Private & Selskap ")
 
     # Guard against the same bug: clean up non-numeric values before grouping/summing
     df_private_selskap['YEAR'] = pd.to_numeric(df_private_selskap['YEAR'], errors='coerce')
