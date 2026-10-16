@@ -19,6 +19,14 @@ import random
 import logging
 import platform
 import atexit
+import sqlite3
+import tempfile
+from contextlib import closing
+
+try:
+    import fcntl  # Linux/macOS: cross-process lock
+except ImportError:  # Windows
+    fcntl = None
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -234,7 +242,7 @@ def pick_matching_result(name, zip_code):
     wanted = set(name_list)
     first_last = {name_list[0], name_list[-1]}
     best = None  # (score, link)
-    for a in driver.find_elements(By.CSS_SELECTOR, "a[href*='/person/']"):
+    for a in driver.find_elements(By.CSS_SELECTOR, "a[href*='/person/'], a[href*='/tlf/']"):
         try:
             link_text = (a.text or a.get_attribute("textContent") or "").strip()
             words = _words(link_text)
@@ -259,6 +267,35 @@ def pick_matching_result(name, zip_code):
     return best[1] if best else None
 
 
+def _result_id(href):
+    m = re.search(r"_(\d+S\d)", href or "")
+    return m.group(1) if m else None
+
+
+def phone_from_result_card(link, zip_code):
+    """Read the phone number straight from the search-result card that
+    contains `link`. The card must belong to ONE person only and must
+    contain the expected postal code, otherwise returns None."""
+    node = link
+    for _ in range(8):
+        try:
+            node = node.find_element(By.XPATH, "..")
+        except Exception:
+            return None
+        ids = {_result_id(a.get_attribute("href"))
+               for a in node.find_elements(By.CSS_SELECTOR, "a[href*='_']")}
+        ids.discard(None)
+        if len(ids) > 1:
+            return None  # went too far up: another person's card is included
+        tels = node.find_elements(By.CSS_SELECTOR, "a[href^='tel:']")
+        if tels:
+            if zip_code and zip_code not in node.text:
+                return None
+            href = tels[0].get_attribute("href") or ""
+            return clean_phone_number(href.replace("tel:", "").strip())
+    return None
+
+
 def log_page_links(limit=15):
     """Diagnostics: print what is actually on the page."""
     try:
@@ -277,10 +314,97 @@ def log_page_links(limit=15):
         print(f"   (could not list links: {e})")
 
 
+# ============================================================
+# POLITENESS SETTINGS (1881.no blocks IPs that send too many requests)
+# ============================================================
+MIN_GAP_SECONDS = 10      # minimum pause between two lookups, shared by ALL users on this server
+PERSON_DELAY = (3, 6)     # extra random pause after each lookup
+CACHE_DAYS = 90           # how long a found number is reused instead of asking 1881 again
+USE_CACHE = os.environ.get("PHONE_CACHE", "1") != "0"   # PHONE_CACHE=0 switches the cache off
+BLOCK_TEXT = "BLOCKED - retry later"
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CACHE_DB = os.path.join(_BASE_DIR, "phone_cache.sqlite3")
+_RATE_FILE = os.path.join(tempfile.gettempdir(), "1881_rate_limit.txt")
+
+
+class BlockedBySite(Exception):
+    """1881.no showed its captcha / 'Blokkert' page."""
+
+
+def is_blocked():
+    try:
+        return "/captcha" in driver.current_url or driver.title.strip().lower() == "blokkert"
+    except Exception:
+        return False
+
+
+def wait_for_turn():
+    """Shared limiter: all running copies of this script (all users) keep
+    at least MIN_GAP_SECONDS between two requests to 1881.no."""
+    if fcntl is None:
+        time.sleep(MIN_GAP_SECONDS)
+        return
+    with open(_RATE_FILE, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            try:
+                last = float(f.read().strip() or 0)
+            except ValueError:
+                last = 0.0
+            wait = last + MIN_GAP_SECONDS - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            f.seek(0)
+            f.truncate()
+            f.write(str(time.time()))
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _cache_conn():
+    conn = sqlite3.connect(_CACHE_DB, timeout=30)
+    conn.execute("CREATE TABLE IF NOT EXISTS phones "
+                 "(name TEXT, zip TEXT, phone TEXT, ts REAL, PRIMARY KEY (name, zip))")
+    return conn
+
+
+def cache_get(name, zip_code):
+    if not USE_CACHE:
+        return None
+    try:
+        with closing(_cache_conn()) as c:
+            row = c.execute("SELECT phone, ts FROM phones WHERE name=? AND zip=?",
+                            (name.lower(), zip_code)).fetchone()
+        if row and time.time() - row[1] < CACHE_DAYS * 86400:
+            return row[0]
+    except Exception as e:
+        print(f"⚠️ Cache read failed: {e}")
+    return None
+
+
+def cache_put(name, zip_code, phone):
+    if not USE_CACHE or not phone or phone == "-" or phone == BLOCK_TEXT:
+        return
+    try:
+        with closing(_cache_conn()) as c:
+            c.execute("INSERT OR REPLACE INTO phones VALUES (?, ?, ?, ?)",
+                      (name.lower(), zip_code, phone, time.time()))
+            c.commit()
+    except Exception as e:
+        print(f"⚠️ Cache write failed: {e}")
+
+
 def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
     """Search 1881.no for a person and return the phone number (or '-')."""
     try:
         print(f"🔍 Searching for: {name} in postal code {zip_code}")
+
+        if is_blocked():
+            raise BlockedBySite()
+        wait_for_turn()
 
         search_input = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search']"))
@@ -289,6 +413,9 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
         search_input.send_keys(f"{name} {zip_code}")
         search_input.submit()
         time.sleep(3)
+
+        if is_blocked():
+            raise BlockedBySite()
 
         current_url = driver.current_url
         print(f"📍 Current URL: {current_url}")
@@ -299,7 +426,7 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
             try:
                 try:
                     WebDriverWait(driver, 8).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/person/']"))
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/person/'], a[href*='/tlf/']"))
                     )
                 except TimeoutException:
                     pass
@@ -310,7 +437,19 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
                     log_page_links()
                     return "-"
 
-                print(f"🔗 Matching result: {match.get_attribute('href')}")
+                href = match.get_attribute("href") or ""
+                print(f"🔗 Matching result: {href}")
+
+                card_phone = phone_from_result_card(match, zip_code)
+                if card_phone:
+                    print(f"✅ Phone read from result card: {card_phone}")
+                    return card_phone
+
+                if "/person/" not in href:
+                    print("❌ Result is not a person page and its card has no phone/postal-code match")
+                    log_page_links()
+                    return "-"
+
                 driver.execute_script("arguments[0].click();", match)
                 time.sleep(3)
 
@@ -435,6 +574,8 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
             return get_phone_number(name, "", retry_count + 1, max_retries)
         return "-"
 
+    except BlockedBySite:
+        raise
     except Exception as e:
         print(f"❌ Error during phone extraction: {e}")
         if retry_count < max_retries:
@@ -460,7 +601,10 @@ except Exception as e:
     driver.quit()
     sys.exit(1)
 
+blocked = False
 for sheet_name in sheets:
+    if blocked:
+        break
     if sheet_name not in wb.sheetnames:
         print(f"⚠️ Sheet '{sheet_name}' not found in workbook, skipping...")
         continue
@@ -502,11 +646,29 @@ for sheet_name in sheets:
                 phone_numbers.append(existing)
                 continue
 
-            phone_number = get_phone_number(name, postcode)
+            cached = cache_get(name, postcode)
+            if cached:
+                print(f"💾 Phone taken from local cache: {cached}")
+                phone_numbers.append(cached)
+                continue
+
+            try:
+                phone_number = get_phone_number(name, postcode)
+            except BlockedBySite:
+                print("⛔ 1881.no has temporarily blocked this server's IP (captcha / 'Blokkert').")
+                print("   Stopping now so the block does not get worse. Try again later.")
+                blocked = True
+                phone_numbers.append(BLOCK_TEXT)
+                break
+
             phone_numbers.append(phone_number)
+            cache_put(name, postcode, phone_number)
             print(f"📞 Result: {phone_number if phone_number else 'No phone found'}")
 
-            time.sleep(random.uniform(2, 4))
+            time.sleep(random.uniform(*PERSON_DELAY))
+
+        if blocked:
+            phone_numbers += [BLOCK_TEXT] * (len(df) - len(phone_numbers))
 
         ws = wb[sheet_name]
         telephone_col = None
@@ -540,4 +702,5 @@ except Exception as e:
     print(f"❌ Error saving workbook: {e}")
 
 driver.quit()
+driver = None
 print("🔄 Browser closed. Process completed!")
