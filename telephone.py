@@ -37,7 +37,7 @@ if len(sys.argv) < 2:
 
 file_path = sys.argv[1]
 # Only private persons are processed. Companies are skipped on purpose.
-sheets = ["Private 2024"]
+sheets = ["Private"]
 
 # The log file is written next to the input Excel file (inside this run's
 # own session folder) so several people running at once don't overwrite
