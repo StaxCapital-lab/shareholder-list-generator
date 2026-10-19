@@ -404,6 +404,28 @@ def cache_put(name, zip_code, phone):
         print(f"⚠️ Cache write failed: {e}")
 
 
+MAX_CAPTCHAS = 3
+_captcha_count = 0
+
+
+def handle_captcha(name):
+    """A captcha appeared: skip this person, go back to the start page.
+    After MAX_CAPTCHAS captchas in one run, stop completely."""
+    global _captcha_count
+    _captcha_count += 1
+    print(f"⚠️ CAPTCHA detected for '{name}' ({_captcha_count}/{MAX_CAPTCHAS})")
+    print(f"   CAPTCHA URL: {driver.current_url}")
+    if _captcha_count >= MAX_CAPTCHAS:
+        raise BlockedBySite()
+    print("   Skipping this person and continuing with the next one.")
+    try:
+        driver.get("https://www.1881.no/")
+        time.sleep(random.uniform(3, 5))
+    except Exception as e:
+        print(f"⚠️ Could not return to 1881 homepage: {e}")
+    return BLOCK_TEXT
+
+
 def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
     """Search 1881.no for a person and return the phone number (or '-')."""
     try:
@@ -413,17 +435,8 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
             raise BlockedBySite()
 
         if is_captcha():
-            rint(f"⚠️ CAPTCHA detected for '{name}'")
-            print(f"   CAPTCHA URL: {driver.current_url}")
-            print("   Skipping this person and continuing with the next one.")
+            return handle_captcha(name)
 
-        try:
-            driver.get("https://www.1881.no/")
-            time.sleep(random.uniform(3, 5))
-        except Exception as e:
-            print(f"⚠️ Could not return to 1881 homepage: {e}")
-
-        return "-"
         wait_for_turn()
 
         search_input = WebDriverWait(driver, 10).until(
@@ -433,21 +446,11 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
         search_input.send_keys(f"{name} {zip_code}")
         search_input.submit()
         time.sleep(3)
-        if is_captcha():
-            print(f"⚠️ CAPTCHA detected for '{name}'")
-            print(f"   CAPTCHA URL: {driver.current_url}")
-            print("   Skipping this person and continuing with the next one.")
 
-        try:
-            driver.get("https://www.1881.no/")
-            time.sleep(random.uniform(3, 5))
-        except Exception as e:
-            print(f"⚠️ Could not return to 1881 homepage: {e}")
-
-        return "-"
-
-        if is_blocked():
+        if is_hard_blocked():
             raise BlockedBySite()
+        if is_captcha():
+            return handle_captcha(name)
 
         current_url = driver.current_url
         print(f"📍 Current URL: {current_url}")
