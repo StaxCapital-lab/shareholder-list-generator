@@ -44,6 +44,49 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 file_path = sys.argv[1]
+
+# ============================================================
+# LIVE LOG: everything this script prints is also appended, line by
+# line, to telephone_live.log next to this script, so it can be watched
+# while it runs:   tail -f /root/shareholder-list-generator/telephone_live.log
+# Every line starts with the session folder name, so several people
+# running at once can be told apart.
+# ============================================================
+class _Tee:
+    def __init__(self, stream, path, tag):
+        self._stream = stream
+        self._f = open(path, "a", encoding="utf-8", buffering=1)
+        self._tag = tag
+        self._buf = ""
+
+    def write(self, text):
+        self._stream.write(text)
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self._f.write(f"[{self._tag}] {line}\n")
+        self._f.flush()
+        return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+try:
+    _live_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telephone_live.log")
+    if os.path.exists(_live_path) and os.path.getsize(_live_path) > 5_000_000:
+        os.replace(_live_path, _live_path + ".old")  # simple size limit
+    _tag = os.path.basename(os.path.dirname(os.path.abspath(file_path))) or "run"
+    sys.stdout = _Tee(sys.stdout, _live_path, _tag)
+except Exception as _e:
+    print(f"(live log disabled: {_e})")
 # Only private persons are processed. Companies are skipped on purpose.
 sheets = ["Private"]
 
@@ -406,6 +449,41 @@ def cache_put(name, zip_code, phone):
 
 MAX_CAPTCHAS = 3
 _captcha_count = 0
+_no_searchbox_streak = 0
+
+
+def find_search_input(timeout=10):
+    """Return the first search box that is really visible and usable."""
+    end = time.time() + timeout
+    while time.time() < end:
+        for el in driver.find_elements(By.CSS_SELECTOR, "input[type='search']"):
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    return el
+            except Exception:
+                continue
+        time.sleep(0.5)
+    return None
+
+
+def reset_to_homepage():
+    try:
+        driver.get("https://www.1881.no/")
+        time.sleep(random.uniform(3, 5))
+        handle_consent_popup()
+    except Exception as e:
+        print(f"⚠️ Could not return to 1881 homepage: {e}")
+
+
+def log_page_state():
+    """Diagnostics: what does the page we are stuck on look like?"""
+    try:
+        print(f"   URL: {driver.current_url}")
+        print(f"   Title: {driver.title}")
+        body = driver.find_element(By.TAG_NAME, "body").text.strip().replace("\n", " ")
+        print(f"   Page text: {body[:300]}")
+    except Exception as e:
+        print(f"   (could not read page state: {e})")
 
 
 def handle_captcha(name):
@@ -439,9 +517,22 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
 
         wait_for_turn()
 
-        search_input = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='search']"))
-        )
+        search_input = find_search_input()
+        if search_input is None:
+            print("⚠️ No usable search box on this page - going back to the 1881 start page")
+            log_page_state()
+            reset_to_homepage()
+            if is_hard_blocked():
+                raise BlockedBySite()
+            search_input = find_search_input()
+        global _no_searchbox_streak
+        if search_input is None:
+            _no_searchbox_streak += 1
+            log_page_state()
+            if _no_searchbox_streak >= 3:
+                raise BlockedBySite()
+            return "-"
+        _no_searchbox_streak = 0
         search_input.clear()
         search_input.send_keys(f"{name} {zip_code}")
         search_input.submit()
@@ -612,7 +703,9 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
     except BlockedBySite:
         raise
     except Exception as e:
-        print(f"❌ Error during phone extraction: {e}")
+        print(f"❌ Error during phone extraction: {str(e).splitlines()[0] if str(e) else e}")
+        if retry_count == 0:
+            log_page_state()
         if retry_count < max_retries:
             print(f"🔄 Retrying after error (attempt {retry_count + 1}/{max_retries})...")
             time.sleep(3)
@@ -690,7 +783,7 @@ for sheet_name in sheets:
             try:
                 phone_number = get_phone_number(name, postcode)
             except BlockedBySite:
-                print("⛔ 1881.no has temporarily blocked this server's IP (captcha / 'Blokkert').")
+                print("⛔ 1881.no is not usable right now (blocked, captcha or changed page).")
                 print("   Stopping now so the block does not get worse. Try again later.")
                 blocked = True
                 phone_numbers.append(BLOCK_TEXT)
