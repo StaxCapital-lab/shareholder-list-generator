@@ -88,7 +88,8 @@ try:
 except Exception as _e:
     print(f"(live log disabled: {_e})")
 # Only private persons are processed. Companies are skipped on purpose.
-sheets = ["Private"]
+# The sheet is looked up by name after the workbook is loaded: it must be
+# called "Private" or "Private <year>" (the app creates "Private 2024").
 
 # The log file is written next to the input Excel file (inside this run's
 # own session folder) so several people running at once don't overwrite
@@ -360,8 +361,8 @@ def log_page_links(limit=15):
 # ============================================================
 # POLITENESS SETTINGS (1881.no blocks IPs that send too many requests)
 # ============================================================
-MIN_GAP_SECONDS = 8     # minimum pause between two lookups, shared by ALL users on this server
-PERSON_DELAY = (2, 5)     # extra random pause after each lookup
+MIN_GAP_SECONDS = 10      # minimum pause between two lookups, shared by ALL users on this server
+PERSON_DELAY = (3, 6)     # extra random pause after each lookup
 CACHE_DAYS = 90           # how long a found number is reused instead of asking 1881 again
 USE_CACHE = os.environ.get("PHONE_CACHE", "1") != "0"   # PHONE_CACHE=0 switches the cache off
 BLOCK_TEXT = "BLOCKED - retry later"
@@ -447,9 +448,15 @@ def cache_put(name, zip_code, phone):
         print(f"⚠️ Cache write failed: {e}")
 
 
-MAX_CAPTCHAS = 10
+# STOP RULE: after this many lookups IN A ROW without a phone number (a "-"
+# or a captcha), the script stops searching. It does NOT crash: the Excel file
+# is still saved, every row that was not searched gets STOP_TEXT in the
+# TELEPHONE column, and the log says clearly that the run stopped early.
+# A found number resets the counter. Rows that never touch 1881.no (existing
+# number, local cache, empty name) do not change the counter.
+MAX_CONSECUTIVE_MISSES = 10
+STOP_TEXT = f"NOT SEARCHED - stopped after {MAX_CONSECUTIVE_MISSES} failed lookups in a row"
 _captcha_count = 0
-_no_searchbox_streak = 0
 
 
 def find_search_input(timeout=10):
@@ -488,13 +495,12 @@ def log_page_state():
 
 def handle_captcha(name):
     """A captcha appeared: skip this person, go back to the start page.
-    After MAX_CAPTCHAS captchas in one run, stop completely."""
+    The result counts as a failed lookup; the script stops only when
+    MAX_CONSECUTIVE_MISSES failed lookups happen in a row."""
     global _captcha_count
     _captcha_count += 1
-    print(f"⚠️ CAPTCHA detected for '{name}' ({_captcha_count}/{MAX_CAPTCHAS})")
+    print(f"⚠️ CAPTCHA detected for '{name}' (captcha no. {_captcha_count} in this run)")
     print(f"   CAPTCHA URL: {driver.current_url}")
-    if _captcha_count >= MAX_CAPTCHAS:
-        raise BlockedBySite()
     print("   Skipping this person and continuing with the next one.")
     try:
         driver.get("https://www.1881.no/")
@@ -525,14 +531,10 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
             if is_hard_blocked():
                 raise BlockedBySite()
             search_input = find_search_input()
-        global _no_searchbox_streak
         if search_input is None:
-            _no_searchbox_streak += 1
+            print("❌ Still no usable search box - skipping this person")
             log_page_state()
-            if _no_searchbox_streak >= 3:
-                raise BlockedBySite()
             return "-"
-        _no_searchbox_streak = 0
         search_input.clear()
         search_input.send_keys(f"{name} {zip_code}")
         search_input.submit()
@@ -729,13 +731,26 @@ except Exception as e:
     driver.quit()
     sys.exit(1)
 
+# Sheets to process: "Private" or "Private <year>". The combined history sheet
+# "Private & Selskap 2014 - 2024" must NOT match, so a strict pattern is used.
+sheets = [s for s in wb.sheetnames if re.fullmatch(r"Private( \d{4})?", s.strip())]
+if not sheets:
+    print("⛔ NO SHEET TO PROCESS: expected a sheet called 'Private' or 'Private <year>'.")
+    print(f"   Sheets in this file: {wb.sheetnames}")
+    print("PHONE_STATUS: NO_PRIVATE_SHEET - no phone numbers were looked up")
+
 blocked = False
+stop_reason = None        # None, "blocked" or "misses"
+stop_text = None          # text written in the rows that were not searched
+miss_streak = 0           # lookups in a row without a number
+total_rows = 0
+searched_rows = 0
+found_rows = 0
+not_searched_rows = 0
+
 for sheet_name in sheets:
     if blocked:
         break
-    if sheet_name not in wb.sheetnames:
-        print(f"⚠️ Sheet '{sheet_name}' not found in workbook, skipping...")
-        continue
 
     print(f"\n📊 Processing sheet: {sheet_name}")
     print("=" * 50)
@@ -780,23 +795,48 @@ for sheet_name in sheets:
                 phone_numbers.append(cached)
                 continue
 
+            # Searching was switched off earlier in this run (site blocked us, or
+            # too many failed lookups in a row). 1881.no is not touched any more,
+            # but the loop goes on so that rows that already have a number (above)
+            # keep it, and every other row is marked clearly instead of left empty.
+            if stop_reason:
+                phone_numbers.append(stop_text)
+                not_searched_rows += 1
+                continue
+
             try:
                 phone_number = get_phone_number(name, postcode)
             except BlockedBySite:
-                print("⛔ 1881.no is not usable right now (blocked, captcha or changed page).")
-                print("   Stopping now so the block does not get worse. Try again later.")
+                print("⛔ 1881.no is not usable right now (blocked page / 'Blokkert').")
+                print("   Searching stops now so the block does not get worse. Try again later.")
                 blocked = True
+                stop_reason = "blocked"
+                stop_text = BLOCK_TEXT
+                searched_rows += 1
                 phone_numbers.append(BLOCK_TEXT)
-                break
+                continue
 
+            searched_rows += 1
             phone_numbers.append(phone_number)
             cache_put(name, postcode, phone_number)
             print(f"📞 Result: {phone_number if phone_number else 'No phone found'}")
 
-            time.sleep(random.uniform(*PERSON_DELAY))
+            if phone_number == "-" or phone_number == BLOCK_TEXT:
+                miss_streak += 1
+                print(f"   Lookups in a row without a number: {miss_streak}/{MAX_CONSECUTIVE_MISSES}")
+                if miss_streak >= MAX_CONSECUTIVE_MISSES:
+                    stop_reason = "misses"
+                    stop_text = STOP_TEXT
+                    print(f"⛔ {MAX_CONSECUTIVE_MISSES} failed lookups in a row - searching stops here.")
+                    print("   The file will still be saved; the remaining rows are marked as not searched.")
+            else:
+                miss_streak = 0
 
-        if blocked:
-            phone_numbers += [BLOCK_TEXT] * (len(df) - len(phone_numbers))
+            if not stop_reason:
+                time.sleep(random.uniform(*PERSON_DELAY))
+
+        total_rows += len(df)
+        found_rows += sum(1 for p in phone_numbers if p not in ("-", "", BLOCK_TEXT, STOP_TEXT))
 
         ws = wb[sheet_name]
         telephone_col = None
@@ -816,6 +856,25 @@ for sheet_name in sheets:
         print(f"❌ Error processing sheet '{sheet_name}': {e}")
         continue
 
+# ---- FINAL SUMMARY: makes it obvious whether the run was complete ----
+print("\n" + "=" * 60)
+if stop_reason == "misses":
+    print(f"⛔ PHONE LOOKUP STOPPED EARLY: {MAX_CONSECUTIVE_MISSES} failed lookups in a row.")
+    print(f"   Searched on 1881.no: {searched_rows} | numbers found in file: {found_rows} | "
+          f"rows NOT searched: {not_searched_rows} (of {total_rows})")
+    print(f"   Those rows contain the text: {STOP_TEXT}")
+    print("   Likely causes: 1881.no changed its page, shows a captcha, or throttles this server.")
+    print(f"PHONE_STATUS: STOPPED_EARLY searched={searched_rows} found={found_rows} not_searched={not_searched_rows}")
+elif stop_reason == "blocked":
+    print("⛔ PHONE LOOKUP STOPPED: 1881.no blocked this server ('Blokkert').")
+    print(f"   Searched on 1881.no: {searched_rows} | numbers found in file: {found_rows} (of {total_rows})")
+    print(f"   Rows that were not searched contain the text: {BLOCK_TEXT}")
+    print(f"PHONE_STATUS: BLOCKED searched={searched_rows} found={found_rows} not_searched={not_searched_rows}")
+elif sheets:
+    print(f"✅ Phone lookup finished normally: numbers found in file: {found_rows} of {total_rows} rows.")
+    print(f"PHONE_STATUS: OK searched={searched_rows} found={found_rows}")
+print("=" * 60)
+
 try:
     wb.save(file_path)
     wb.close()
@@ -825,7 +884,10 @@ try:
     file_base, file_ext = os.path.splitext(file_name)
     new_file_name = f"{file_base} (T){file_ext}"
     os.rename(file_path, os.path.join(file_dir, new_file_name))
-    print(f"✅ SUCCESS: Phone numbers added and file saved as: {new_file_name}")
+    if stop_reason or not sheets:
+        print(f"⚠️ File saved WITH GAPS as: {new_file_name}")
+    else:
+        print(f"✅ SUCCESS: Phone numbers added and file saved as: {new_file_name}")
 except Exception as e:
     print(f"❌ Error saving workbook: {e}")
 
