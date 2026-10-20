@@ -360,8 +360,8 @@ def log_page_links(limit=15):
 # ============================================================
 # POLITENESS SETTINGS (1881.no blocks IPs that send too many requests)
 # ============================================================
-MIN_GAP_SECONDS = 10      # minimum pause between two lookups, shared by ALL users on this server
-PERSON_DELAY = (3, 6)     # extra random pause after each lookup
+MIN_GAP_SECONDS = 8     # minimum pause between two lookups, shared by ALL users on this server
+PERSON_DELAY = (2, 5)     # extra random pause after each lookup
 CACHE_DAYS = 90           # how long a found number is reused instead of asking 1881 again
 USE_CACHE = os.environ.get("PHONE_CACHE", "1") != "0"   # PHONE_CACHE=0 switches the cache off
 BLOCK_TEXT = "BLOCKED - retry later"
@@ -447,7 +447,7 @@ def cache_put(name, zip_code, phone):
         print(f"⚠️ Cache write failed: {e}")
 
 
-MAX_CAPTCHAS = 3
+MAX_CAPTCHAS = 10
 _captcha_count = 0
 _no_searchbox_streak = 0
 
