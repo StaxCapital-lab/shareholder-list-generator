@@ -22,6 +22,7 @@ import atexit
 import sqlite3
 import tempfile
 from contextlib import closing
+from urllib.parse import urlparse
 
 try:
     import fcntl  # Linux/macOS: cross-process lock
@@ -273,6 +274,19 @@ def clean_phone_number(phone_number):
     return cleaned
 
 
+def is_main_1881(url):
+    """True only for addresses on www.1881.no itself. Other sites also use
+    "/person/" in their addresses (e.g. proff.no/aksjonaerer/person/...), so
+    the web address must never be judged by that word alone."""
+    host = (urlparse(url or "").hostname or "").lower()
+    return host in ("www.1881.no", "1881.no")
+
+
+def is_1881_person_url(url):
+    """A person page ON 1881.no (not just any address containing /person/)."""
+    return is_main_1881(url) and "/person/" in (urlparse(url).path or "")
+
+
 def _words(text):
     return set(re.findall(r"\w+", text.lower()))
 
@@ -288,6 +302,8 @@ def pick_matching_result(name, zip_code):
     best = None  # (score, link)
     for a in driver.find_elements(By.CSS_SELECTOR, "a[href*='/person/'], a[href*='/tlf/']"):
         try:
+            if not is_main_1881(a.get_attribute("href")):
+                continue  # e.g. a proff.no / regnskapstall.no result: never follow it
             link_text = (a.text or a.get_attribute("textContent") or "").strip()
             words = _words(link_text)
             if wanted <= words:
@@ -523,6 +539,14 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
 
         wait_for_turn()
 
+        # The browser must be on 1881.no. If an earlier step left it somewhere
+        # else (e.g. on proff.no), go back to the 1881 start page first.
+        if not is_main_1881(driver.current_url):
+            print(f"⚠️ Browser is not on 1881.no ({driver.current_url[:80]}) - going back to the 1881 start page")
+            reset_to_homepage()
+            if is_hard_blocked():
+                raise BlockedBySite()
+
         search_input = find_search_input()
         if search_input is None:
             print("⚠️ No usable search box on this page - going back to the 1881 start page")
@@ -549,7 +573,7 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
         print(f"📍 Current URL: {current_url}")
 
         # Search results page (1881 skips it when exactly one person matches)
-        if "/person/" not in current_url:
+        if not is_1881_person_url(current_url):
             print("📋 On search results page, looking for a matching person...")
             try:
                 try:
@@ -573,7 +597,7 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
                     print(f"✅ Phone read from result card: {card_phone}")
                     return card_phone
 
-                if "/person/" not in href:
+                if not is_1881_person_url(href):
                     print("❌ Result is not a person page and its card has no phone/postal-code match")
                     log_page_links()
                     return "-"
@@ -583,14 +607,14 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
 
                 current_url = driver.current_url
                 print(f"📍 After click - Current URL: {current_url}")
-                if "/person/" not in current_url:
+                if not is_1881_person_url(current_url):
                     print("❌ Failed to navigate to person detail page after clicking")
                     return "-"
             except Exception as e:
                 print(f"❌ Error clicking matching result: {e}")
                 return "-"
 
-        if "/person/" in current_url:
+        if is_1881_person_url(current_url):
             print("✅ Successfully navigated to person detail page!")
 
             # Verify the name on the page
@@ -710,7 +734,7 @@ def get_phone_number(name, zip_code, retry_count=0, max_retries=2):
             log_page_state()
         if retry_count < max_retries:
             print(f"🔄 Retrying after error (attempt {retry_count + 1}/{max_retries})...")
-            time.sleep(3)
+            reset_to_homepage()  # start the retry from a clean 1881 page, not from the broken one
             return get_phone_number(name, zip_code, retry_count + 1, max_retries)
         return "-"
 
