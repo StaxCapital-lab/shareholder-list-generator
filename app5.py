@@ -301,11 +301,11 @@ def write_data(company_name_input, session_folder):
         print("❌ No xlsx files in this session's folder - nothing to process")
         return 'This company has no shareholders'
 
-    template_path = os.path.join(os.getcwd(), 'Template(2026.10.14.).xlsx')
+    template_path = os.path.join(os.getcwd(), 'Template(2026.10.22.).xlsx')
     if not os.path.exists(template_path):
         raise FileNotFoundError(
             f"Template file not found: {template_path}. "
-            "Make sure 'Template(2026.10.14.).xlsx' is in the same folder as the program."
+            "Make sure 'Template(2026.10.22.).xlsx' is in the same folder as the program."
         )
 
     book = load_workbook(template_path)
