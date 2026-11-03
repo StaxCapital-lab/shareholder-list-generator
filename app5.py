@@ -624,10 +624,10 @@ if st.button("Search and Download"):
             else:
                 # Step 3: (optional) add phone numbers
                 if include_phone_numbers:
-                    telephone_script = os.path.join(os.getcwd(), "telephone.py")
+                    telephone_script = os.path.join(os.getcwd(), "telephone_infotorg.py")
                     if not os.path.exists(telephone_script):
-                        st.error("telephone.py not found - skipping phone number lookup.")
-                        print(f"❌ telephone.py not found at {telephone_script}")
+                        st.error("telephone_infotorg.py not found - skipping phone number lookup.")
+                        print(f"❌ telephone_infotorg.py not found at {telephone_script}")
                     elif not os.path.exists(_file_pathexcel):
                         st.error(f"Excel file not found: {_file_pathexcel}")
                         print(f"❌ ERROR: Excel file not found: {_file_pathexcel}")
