@@ -332,8 +332,8 @@ def lookup_person(driver, name, zip_code, attempt=0):
     if not answered:
         _timeouts_in_row += 1
         print("⚠️ No answer from the site within 20 s")
-        if _timeouts_in_row >= 3:
-            raise BlockedBySite("3 timeouts in a row")
+        if _timeouts_in_row >= 8:
+            raise BlockedBySite("8 timeouts in a row")
         return "-", "TIMEOUT"
     _timeouts_in_row = 0
 
