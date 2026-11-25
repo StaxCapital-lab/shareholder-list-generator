@@ -632,16 +632,77 @@ if st.button("Search and Download"):
                         st.error(f"Excel file not found: {_file_pathexcel}")
                         print(f"❌ ERROR: Excel file not found: {_file_pathexcel}")
                     else:
-                        with st.spinner("Adding phone numbers..."):
-                            result = subprocess.run(
+                        # Show live telephone lookup progress in the Streamlit page.
+                        progress_bar = st.progress(0)
+                        progress_text = st.empty()
+                        current_person_text = st.empty()
+
+                        env = os.environ.copy()
+                        env["PYTHONUNBUFFERED"] = "1"
+
+                        process = None
+                        try:
+                            process = subprocess.Popen(
                                 [sys.executable, telephone_script, _file_pathexcel],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace"
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                bufsize=1,
+                                env=env,
                             )
-                        print(result.stdout)
-                        print(result.stderr)
-                        if result.returncode != 0:
-                            st.error(f"Telephone extraction failed: {result.stderr}")
-                            print(f"❌ Telephone script error: {result.stderr}")
+
+                            # Read output as it is produced, rather than waiting
+                            # until the telephone script has completely finished.
+                            for line in iter(process.stdout.readline, ""):
+                                print(line, end="", flush=True)
+
+                                # Expected format:
+                                # Processing 55/230: JOHN HANSEN (Zip: 1234)
+                                match = re.search(
+                                    r"Processing\\s+(\\d+)\\s*/\\s*(\\d+)\\s*:?\\s*(.*)",
+                                    line,
+                                    flags=re.IGNORECASE,
+                                )
+
+                                if match:
+                                    current = int(match.group(1))
+                                    total = int(match.group(2))
+                                    person = match.group(3).strip()
+
+                                    fraction = min(current / total, 1.0) if total > 0 else 0.0
+                                    progress_bar.progress(fraction)
+                                    progress_text.markdown(
+                                        f"**Searching phone number {current}/{total}**"
+                                    )
+                                    if person:
+                                        current_person_text.caption(person)
+
+                            process.stdout.close()
+                            return_code = process.wait()
+
+                        finally:
+                            # If this block errors unexpectedly, do not leave
+                            # the telephone subprocess running in the background.
+                            if process is not None and process.poll() is None:
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                    process.wait()
+
+                            progress_bar.empty()
+                            progress_text.empty()
+                            current_person_text.empty()
+
+                        if return_code != 0:
+                            st.error(
+                                f"Telephone extraction failed (exit code {return_code}). "
+                                "Check the server log for details."
+                            )
+                            print(f"❌ Telephone script exited with code {return_code}")
                         else:
                             print("✅ Telephone extraction completed successfully")
 
