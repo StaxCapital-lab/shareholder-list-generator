@@ -370,12 +370,10 @@ class _Tee:
     def write(self, text):
         self._stream.write(text)
         self._buf += text
-         while "\n" in self._buf:
+        while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             if line.strip():
                 self._f.write(f"[{self._tag}] {line}\n")
-            self._stream.flush()
-
         self._f.flush()
         return len(text)
 
@@ -551,3 +549,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
