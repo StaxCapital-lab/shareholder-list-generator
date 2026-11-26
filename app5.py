@@ -592,6 +592,65 @@ def delete_session_folder(session_folder, max_attempts=5, delay_seconds=1):
 
 
 # ============================================================
+# 6b. PHONE LOOKUP WITH LIVE PROGRESS
+# ============================================================
+# Runs telephone_infotorg.py as a subprocess and reads its output line by
+# line while it is running. The script prints a line such as
+#   "📋 Processing 41/126: NAME (0123 CITY)"
+# for every person, so we pick the numbers out of it and update a
+# placeholder on the page ("Processing 41/126") plus a progress bar.
+PROGRESS_RE = re.compile(r"Processing (\d+)/(\d+):\s*(.*)")
+SHEET_RE = re.compile(r"Processing sheet:\s*(.*)")
+
+
+def run_telephone_script(script_path, excel_path):
+    status_box = st.empty()
+    bar = st.progress(0)
+    status_box.info("Starting phone number lookup...")
+
+    # -u / PYTHONUNBUFFERED: without it the child buffers its output when
+    # it is connected to a pipe and we would see nothing until it finishes.
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", script_path, excel_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,   # merged, so a full stderr pipe can never block the child
+        text=True, encoding="utf-8", errors="replace",
+        env=env, bufsize=1,
+    )
+
+    output_lines = []
+    sheet = ""
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            output_lines.append(line)
+            print(line)
+
+            m = SHEET_RE.search(line)
+            if m:
+                sheet = m.group(1).strip()
+                continue
+
+            m = PROGRESS_RE.search(line)
+            if m:
+                current, total = int(m.group(1)), int(m.group(2))
+                person = m.group(3).strip()
+                title = f"**Processing {current}/{total}**"
+                if sheet:
+                    title += f"  ·  {sheet}"
+                status_box.info(f"{title}\n\n{person}")
+                bar.progress(min(current / max(total, 1), 1.0))
+    finally:
+        proc.stdout.close()
+        returncode = proc.wait()
+
+    bar.empty()
+    status_box.empty()
+    return returncode, "\n".join(output_lines)
+
+
+# ============================================================
 # 7. STREAMLIT UI
 # ============================================================
 st.title("Shareholder List Generator")
@@ -632,16 +691,10 @@ if st.button("Search and Download"):
                         st.error(f"Excel file not found: {_file_pathexcel}")
                         print(f"❌ ERROR: Excel file not found: {_file_pathexcel}")
                     else:
-                        with st.spinner("Adding phone numbers..."):
-                            result = subprocess.run(
-                                [sys.executable, telephone_script, _file_pathexcel],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace"
-                            )
-                        print(result.stdout)
-                        print(result.stderr)
-                        if result.returncode != 0:
-                            st.error(f"Telephone extraction failed: {result.stderr}")
-                            print(f"❌ Telephone script error: {result.stderr}")
+                        returncode, tel_output = run_telephone_script(telephone_script, _file_pathexcel)
+                        if returncode != 0:
+                            st.error("Telephone extraction failed:\n\n" + "\n".join(tel_output.splitlines()[-20:]))
+                            print(f"❌ Telephone script error (exit code {returncode})")
                         else:
                             print("✅ Telephone extraction completed successfully")
 
