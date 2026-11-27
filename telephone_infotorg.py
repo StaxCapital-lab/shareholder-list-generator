@@ -198,15 +198,21 @@ def cache_get(name, zip_code):
 
 
 def cache_put(name, zip_code, formatted):
+    """Stores a found number. Retries a few times (e.g. if another copy of the
+    script holds the database for a moment) and never raises."""
     if not USE_CACHE or not formatted:
         return
-    try:
-        with closing(_cache_conn()) as c:
-            c.execute("INSERT OR REPLACE INTO phones VALUES (?, ?, ?, ?)",
-                      (name.lower(), zip_code, formatted, time.time()))
-            c.commit()
-    except Exception as e:
-        print(f"⚠️ Cache write failed: {e}")
+    for attempt in range(1, 4):
+        try:
+            with closing(_cache_conn()) as c:
+                c.execute("INSERT OR REPLACE INTO phones VALUES (?, ?, ?, ?)",
+                          (name.lower(), zip_code, formatted, time.time()))
+                c.commit()
+            return
+        except Exception as e:
+            print(f"⚠️ Cache write failed (attempt {attempt}/3): {e}")
+            time.sleep(1)
+    print(f"⚠️ Could NOT cache the number for {name} - it will be searched again next time")
 
 
 # ============================================================
@@ -431,23 +437,78 @@ def main(argv=None):
     sheets = private_sheets(wb.sheetnames)
     print(f"📋 Sheets to process: {sheets}")
 
-    driver = None
+    # Shared state. "blocked" means: do NOT search the site any more (blocked,
+    # 8 timeouts in a row, or Chrome cannot start). It never stops the run:
+    # every remaining row is still filled from the file / the local cache.
+    state = {"driver": None, "blocked": False}
+    stats = {}
 
-    def _cleanup():
+    def _quit_driver():
         try:
-            if driver is not None:
-                driver.quit()
+            if state["driver"] is not None:
+                state["driver"].quit()
         except Exception:
             pass
+        state["driver"] = None
 
-    atexit.register(_cleanup)
+    atexit.register(_quit_driver)
 
-    stats = {}
-    blocked = False
+    def resolve_row(row, name, zip_code, zip_city):
+        """Returns the TELEPHONE value for one row."""
+        if not name or name.lower() in ("nan", "none"):
+            return "-"
+        if not zip_code:
+            print("   Skipped: no Norwegian postal code")
+            stats["SKIPPED_NO_ZIP"] = stats.get("SKIPPED_NO_ZIP", 0) + 1
+            return "-"
+
+        # 1) number already in the file (a leftover BLOCKED text does not count)
+        existing = str(row.get("TELEPHONE")).strip() if pd.notna(row.get("TELEPHONE")) else ""
+        if existing and existing not in ("-", BLOCK_TEXT):
+            print(f"✅ Phone number already in the file: {existing}")
+            return existing
+
+        # 2) local cache - ALWAYS checked, even after the site has blocked us
+        cached = cache_get(name, zip_code)
+        if cached:
+            print(f"💾 Phone taken from local cache: {cached}")
+            stats["CACHE"] = stats.get("CACHE", 0) + 1
+            return cached
+
+        # 3) search on the site - only while it is usable
+        if state["blocked"]:
+            print("   Not searched (site blocked earlier) - not in the cache")
+            stats["BLOCKED"] = stats.get("BLOCKED", 0) + 1
+            return BLOCK_TEXT
+
+        if state["driver"] is None:
+            try:
+                state["driver"] = make_driver()
+                print("🔧 Chrome started")
+            except Exception as e:
+                print(f"❌ Chrome could not be started ({e}). No more searches - cache is still used.")
+                state["blocked"] = True
+                stats["BLOCKED"] = stats.get("BLOCKED", 0) + 1
+                return BLOCK_TEXT
+
+        try:
+            value, status = lookup_person(state["driver"], name, zip_code)
+        except BlockedBySite as e:
+            print(f"⛔ Infotorg is not usable right now ({e}).")
+            print("   No more searches in this run - the remaining rows are still filled from the cache.")
+            state["blocked"] = True
+            stats["BLOCKED"] = stats.get("BLOCKED", 0) + 1
+            return BLOCK_TEXT
+
+        stats[status] = stats.get(status, 0) + 1
+        if status == "ERROR":
+            _quit_driver()   # next row starts a fresh Chrome
+        if status == "FOUND_MOBILE":
+            cache_put(name, zip_code, value)
+        print(f"📞 Result: {value}")
+        return value
 
     for sheet_name in sheets:
-        if blocked:
-            break
         print(f"\n📊 Processing sheet: {sheet_name}")
         print("=" * 50)
         try:
@@ -466,57 +527,28 @@ def main(argv=None):
                 zip_city = str(row["ZIP CODE / CITY"]).strip()
                 zip_code = extract_zip(zip_city)
                 print(f"\n📋 Processing {index + 1}/{len(df)}: {name} ({zip_city})")
-
-                if not name or name.lower() in ("nan", "none"):
-                    phone_numbers.append("-")
-                    continue
-                if not zip_code:
-                    print("   Skipped: no Norwegian postal code")
-                    stats["SKIPPED_NO_ZIP"] = stats.get("SKIPPED_NO_ZIP", 0) + 1
-                    phone_numbers.append("-")
-                    continue
-
-                existing = str(row.get("TELEPHONE")).strip() if pd.notna(row.get("TELEPHONE")) else ""
-                if existing and existing != "-":
-                    print(f"✅ Phone number already in the file: {existing}")
-                    phone_numbers.append(existing)
-                    continue
-
-                cached = cache_get(name, zip_code)
-                if cached:
-                    print(f"💾 Phone taken from local cache: {cached}")
-                    stats["CACHE"] = stats.get("CACHE", 0) + 1
-                    phone_numbers.append(cached)
-                    continue
-
                 try:
-                    if driver is None:
-                        driver = make_driver()
-                        print("🔧 Chrome started")
-                    value, status = lookup_person(driver, name, zip_code)
-                except BlockedBySite as e:
-                    print(f"⛔ Infotorg is not usable right now ({e}).")
-                    print("   Stopping now so the problem does not get worse. Try again later.")
-                    blocked = True
-                    phone_numbers.append(BLOCK_TEXT)
-                    break
-                stats[status] = stats.get(status, 0) + 1
+                    value = resolve_row(row, name, zip_code, zip_city)
+                except Exception as e:
+                    # One bad row must never cost us the rows already found.
+                    print(f"❌ Unexpected error on this row: {e}")
+                    value = "-"
                 phone_numbers.append(value)
-                if status == "FOUND_MOBILE":
-                    cache_put(name, zip_code, value)
-                print(f"📞 Result: {value}")
 
-            if blocked:
-                phone_numbers += [BLOCK_TEXT] * (len(df) - len(phone_numbers))
+            # Always exactly one value per row, so the sheet is always written.
+            if len(phone_numbers) < len(df):
+                phone_numbers += ["-"] * (len(df) - len(phone_numbers))
 
             ws = wb[sheet_name]
             telephone_col = next((i for i, c in enumerate(df.columns, 1) if c == "TELEPHONE"), None)
-            if telephone_col and len(phone_numbers) == len(df):
+            if telephone_col:
+                if ws.cell(row=1, column=telephone_col).value in (None, ""):
+                    ws.cell(row=1, column=telephone_col, value="TELEPHONE")
                 for i, value in enumerate(phone_numbers, start=2):
                     ws.cell(row=i, column=telephone_col, value=value)
                 print(f"✅ Updated {len(phone_numbers)} phone numbers in sheet '{sheet_name}'")
             else:
-                print(f"⚠️ Could not update sheet '{sheet_name}' - column mismatch")
+                print(f"⚠️ Could not update sheet '{sheet_name}' - no TELEPHONE column")
         except Exception as e:
             print(f"❌ Error processing sheet '{sheet_name}': {e}")
             continue
@@ -524,29 +556,31 @@ def main(argv=None):
     print("\n================ SUMMARY ================")
     for status in sorted(stats):
         print(f"  {status:20s} {stats[status]}")
-    print("STOPPED EARLY (blocked)" if blocked else "Finished without stopping.")
+    print("STOPPED SEARCHING EARLY (blocked) - cached numbers were still filled in"
+          if state["blocked"] else "Finished without stopping.")
 
+    # Save straight to the final "(T)" name first; the original file is only
+    # removed after that worked, so a failed save can never lose the numbers.
     try:
-        wb.save(file_path)
-        wb.close()
-        print("\n💾 Workbook saved successfully")
         file_dir, file_name = os.path.split(file_path)
         file_base, file_ext = os.path.splitext(file_name)
         new_file_name = f"{file_base} (T){file_ext}"
-        os.replace(file_path, os.path.join(file_dir, new_file_name))
+        target = os.path.join(file_dir, new_file_name)
+        wb.save(target)
+        wb.close()
+        print("\n💾 Workbook saved successfully")
+        try:
+            if os.path.abspath(target) != os.path.abspath(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            print(f"(could not remove the original file: {e})")
         print(f"✅ SUCCESS: Phone numbers added and file saved as: {new_file_name}")
     except Exception as e:
         print(f"❌ Error saving workbook: {e}")
 
-    if driver is not None:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        driver = None
+    _quit_driver()
     print("🔄 Browser closed. Process completed!")
 
 
 if __name__ == "__main__":
     main()
-
